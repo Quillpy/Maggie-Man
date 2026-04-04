@@ -1,155 +1,322 @@
 """
-Lichess API client for fetching broadcast/tournament data.
-No auth token needed for public broadcast endpoints.
+Lichess API client: broadcast endpoints (GET) + cloud eval.
 
-Correct endpoints (verified from Lichess API spec):
-  GET /api/broadcast/{broadcastTournamentId}
-      → Returns tournament + embedded rounds array (JSON)
-  GET /api/broadcast/{tournSlug}/{roundSlug}/{roundId}
-      → Returns a single round's metadata + games (slugs can be "-")
-  GET /api/broadcast/round/{roundId}.pgn
-      → Multi-game PGN for all games in a round
-  GET /api/cloud-eval?fen=...&multiPv=N
-      → Lichess cached Stockfish cloud evaluation
+Spec: https://lichess.org/api#tag/broadcasts
 """
 
-import aiohttp
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
-from config import LICHESS_API_BASE, CANDIDATES_BROADCAST_ID, LICHESS_CLOUD_EVAL_URL
+from typing import Any, AsyncIterator
+
+import aiohttp
 
 logger = logging.getLogger("maggie-man.lichess")
 
 
 class LichessClient:
-    def __init__(self):
-        self.base = LICHESS_API_BASE
+    def __init__(
+        self,
+        api_base: str,
+        cloud_eval_url: str,
+        site_base: str,
+        oauth_token: str | None = None,
+    ):
+        self.api_base = api_base.rstrip("/")
+        self.cloud_eval_url = cloud_eval_url
+        self.site_base = site_base.rstrip("/")
+        self.oauth_token = oauth_token
         self.session: aiohttp.ClientSession | None = None
+
+    def _auth_headers(self) -> dict[str, str]:
+        h: dict[str, str] = {}
+        if self.oauth_token:
+            h["Authorization"] = f"Bearer {self.oauth_token}"
+        return h
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
             self.session = aiohttp.ClientSession(
-                headers={"User-Agent": "MaggieManBot/1.0 (Discord Chess Bot)"},
-                timeout=aiohttp.ClientTimeout(total=20),
+                headers={
+                    "User-Agent": "MaggieManBot/1.0 (Discord Chess Bot)",
+                    **self._auth_headers(),
+                },
+                timeout=aiohttp.ClientTimeout(total=30),
             )
         return self.session
 
-    async def close(self):
+    async def close(self) -> None:
         if self.session and not self.session.closed:
             await self.session.close()
+            self.session = None
 
-    # ── Broadcast tournament (includes rounds list) ───────────────────────────
-
-    async def get_broadcast_with_rounds(self) -> dict | None:
-        """
-        GET /api/broadcast/{broadcastTournamentId}
-
-        Returns the full tournament object including a 'rounds' array.
-        Each round in the array has shape:
-        {
-          "id": "jUqeCOHI",
-          "name": "Round 5",
-          "slug": "round-5",
-          "url": "https://lichess.org/broadcast/.../round-5/jUqeCOHI",
-          "createdAt": 1234567890000,
-          "startsAt": 1234567890000,   # ms epoch, may be absent
-          "ongoing": true,
-          "finished": false
-        }
-        """
-        url = f"{self.base}/broadcast/{CANDIDATES_BROADCAST_ID}"
+    async def _get_json(self, url: str, **kwargs: Any) -> Any | None:
         try:
             session = await self._get_session()
-            async with session.get(url, headers={"Accept": "application/json"}) as resp:
+            async with session.get(url, **kwargs) as resp:
                 if resp.status == 200:
-                    data = await resp.json()
-                    rounds = data.get("rounds", [])
-                    logger.info(f"get_broadcast_with_rounds: got {len(rounds)} rounds")
-                    return data
+                    return await resp.json()
                 body = await resp.text()
-                logger.warning(f"get_broadcast_with_rounds: HTTP {resp.status} → {body[:300]}")
+                logger.warning("GET %s → HTTP %s: %s", url, resp.status, body[:300])
                 return None
         except Exception as e:
-            logger.error(f"get_broadcast_with_rounds error: {e}", exc_info=True)
+            logger.error("GET %s error: %s", url, e, exc_info=True)
             return None
 
-    async def get_broadcast_rounds(self) -> list[dict]:
-        """
-        Convenience wrapper — returns just the rounds list from the tournament.
-        Each item is a round dict with id, name, ongoing, finished, startsAt etc.
-        """
-        data = await self.get_broadcast_with_rounds()
+    async def _get_text(self, url: str, **kwargs: Any) -> str | None:
+        try:
+            session = await self._get_session()
+            async with session.get(url, **kwargs) as resp:
+                if resp.status == 200:
+                    return await resp.text()
+                body = await resp.text()
+                logger.warning("GET %s → HTTP %s: %s", url, resp.status, body[:200])
+                return None
+        except Exception as e:
+            logger.error("GET %s error: %s", url, e, exc_info=True)
+            return None
+
+    # --- GET /api/broadcast (official, NDJSON stream) ---
+
+    async def get_official_broadcasts(self, nb: int = 20, html: bool = False) -> list[dict]:
+        """Parse NDJSON stream into a list (caps at nb lines)."""
+        url = f"{self.api_base}/broadcast"
+        params: dict[str, str | int] = {"nb": max(1, min(100, nb))}
+        if html:
+            params["html"] = "true"
+        out: list[dict] = []
+        try:
+            session = await self._get_session()
+            async with session.get(
+                url,
+                params=params,
+                headers={"Accept": "application/x-ndjson"},
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning("official broadcasts HTTP %s", resp.status)
+                    return []
+                text = await resp.text()
+                for line in text.splitlines():
+                    if len(out) >= nb:
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        out.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+        except Exception as e:
+            logger.error("get_official_broadcasts: %s", e, exc_info=True)
+        return out
+
+    # --- GET /api/broadcast/top ---
+
+    async def get_broadcast_top(self, page: int = 1, html: bool = False) -> dict | None:
+        url = f"{self.api_base}/broadcast/top"
+        params: dict[str, str | int] = {"page": max(1, min(20, page))}
+        if html:
+            params["html"] = "true"
+        return await self._get_json(url, params=params, headers={"Accept": "application/json"})
+
+    # --- GET /api/broadcast/by/{username} ---
+
+    async def get_broadcasts_by_user(
+        self, username: str, page: int = 1, html: bool = False
+    ) -> dict | None:
+        url = f"{self.api_base}/broadcast/by/{username}"
+        params: dict[str, str | int] = {"page": max(1, page)}
+        if html:
+            params["html"] = "true"
+        return await self._get_json(url, params=params, headers={"Accept": "application/json"})
+
+    # --- GET /api/broadcast/search ---
+
+    async def search_broadcasts(self, q: str, page: int = 1) -> dict | None:
+        url = f"{self.api_base}/broadcast/search"
+        params = {"q": q, "page": max(1, min(20, page))}
+        return await self._get_json(url, params=params, headers={"Accept": "application/json"})
+
+    # --- GET /api/broadcast/{broadcastTournamentId} ---
+
+    async def get_broadcast_tournament(self, broadcast_tournament_id: str) -> dict | None:
+        tid = broadcast_tournament_id.strip()
+        if len(tid) != 8:
+            logger.warning("broadcast tournament id should be 8 chars, got %r", tid)
+        url = f"{self.api_base}/broadcast/{tid}"
+        return await self._get_json(url, headers={"Accept": "application/json"})
+
+    async def get_broadcast_with_rounds(self, broadcast_tournament_id: str | None = None) -> dict | None:
+        """Alias used by monitor: fetch tournament + rounds."""
+        bid = (broadcast_tournament_id or "").strip()
+        if not bid:
+            return None
+        return await self.get_broadcast_tournament(bid)
+
+    async def get_broadcast_rounds(self, broadcast_tournament_id: str | None = None) -> list[dict]:
+        data = await self.get_broadcast_with_rounds(broadcast_tournament_id)
         if not data:
             return []
         return data.get("rounds", [])
 
-    # ── Round PGN ─────────────────────────────────────────────────────────────
+    # --- GET /api/broadcast/{slug}/{roundSlug}/{roundId} ---
 
-    async def get_round_pgn(self, round_id: str) -> str | None:
+    async def get_broadcast_round(
+        self,
+        broadcast_round_id: str,
+        broadcast_tournament_slug: str = "-",
+        broadcast_round_slug: str = "-",
+    ) -> dict | None:
+        rid = broadcast_round_id.strip()
+        url = (
+            f"{self.api_base}/broadcast/"
+            f"{broadcast_tournament_slug}/{broadcast_round_slug}/{rid}"
+        )
+        return await self._get_json(url, headers={"Accept": "application/json"})
+
+    # --- GET /api/broadcast/round/{roundId}.pgn ---
+
+    async def get_round_pgn(
+        self,
+        round_id: str,
+        clocks: bool = True,
+        comments: bool = True,
+    ) -> str | None:
+        url = f"{self.api_base}/broadcast/round/{round_id}.pgn"
+        params = {"clocks": str(clocks).lower(), "comments": str(comments).lower()}
+        return await self._get_text(
+            url,
+            params=params,
+            headers={"Accept": "application/x-chess-pgn"},
+        )
+
+    # --- GET /api/broadcast/{broadcastTournamentId}.pgn ---
+
+    async def get_tournament_pgn(
+        self,
+        broadcast_tournament_id: str,
+        clocks: bool = True,
+        comments: bool = True,
+    ) -> str | None:
+        tid = broadcast_tournament_id.strip()
+        url = f"{self.api_base}/broadcast/{tid}.pgn"
+        params = {"clocks": str(clocks).lower(), "comments": str(comments).lower()}
+        return await self._get_text(
+            url,
+            params=params,
+            headers={"Accept": "application/x-chess-pgn"},
+        )
+
+    # --- GET /api/stream/broadcast/round/{roundId}.pgn (streaming) ---
+
+    async def stream_round_pgn_lines(
+        self,
+        round_id: str,
+        clocks: bool = True,
+        comments: bool = True,
+    ) -> AsyncIterator[str]:
         """
-        GET /api/broadcast/round/{roundId}.pgn
-
-        Returns multi-game PGN for all games in a round.
-        Lichess embeds FEN annotations as { [%fen <FEN>] } in move comments
-        so we never need to replay moves to get the current position.
-
-        round_id is the 8-character round ID, e.g. "jUqeCOHI"
+        Yield text chunks from the live PGN stream. Caller must cancel the task to stop.
+        https://lichess.org/api#tag/broadcasts/GET/api/stream/broadcast/round/{broadcastRoundId}.pgn
         """
-        url = f"{self.base}/broadcast/round/{round_id}.pgn"
+        url = f"{self.api_base}/stream/broadcast/round/{round_id}.pgn"
+        params = {"clocks": str(clocks).lower(), "comments": str(comments).lower()}
+        session = await self._get_session()
+        try:
+            async with session.get(
+                url,
+                params=params,
+                headers={"Accept": "application/x-chess-pgn"},
+            ) as resp:
+                if resp.status != 200:
+                    return
+                async for chunk in resp.content.iter_chunked(8192):
+                    yield chunk.decode("utf-8", errors="replace")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error("stream_round_pgn_lines: %s", e, exc_info=True)
+
+    # --- Site paths under /broadcast/{id}/... (not under /api/) ---
+
+    async def get_broadcast_players(self, broadcast_tournament_id: str) -> list | None:
+        tid = broadcast_tournament_id.strip()
+        url = f"{self.site_base}/broadcast/{tid}/players"
+        data = await self._get_json(url, headers={"Accept": "application/json"})
+        return data if isinstance(data, list) else None
+
+    async def get_broadcast_player(
+        self, broadcast_tournament_id: str, player_id: str
+    ) -> dict | None:
+        tid = broadcast_tournament_id.strip()
+        pid = player_id.strip()
+        url = f"{self.site_base}/broadcast/{tid}/players/{pid}"
+        data = await self._get_json(url, headers={"Accept": "application/json"})
+        return data if isinstance(data, dict) else None
+
+    async def get_broadcast_team_standings(self, broadcast_tournament_id: str) -> list | None:
+        tid = broadcast_tournament_id.strip()
+        url = f"{self.site_base}/broadcast/{tid}/teams/standings"
+        data = await self._get_json(url, headers={"Accept": "application/json"})
+        return data if isinstance(data, list) else None
+
+    # --- GET /api/broadcast/my-rounds (OAuth) ---
+
+    async def get_my_broadcast_rounds(self, nb: int = 20) -> list[dict]:
+        """Requires LICHESS_API_TOKEN with study:read."""
+        if not self.oauth_token:
+            return []
+        url = f"{self.api_base}/broadcast/my-rounds"
+        params = {"nb": max(1, nb)}
+        out: list[dict] = []
         try:
             session = await self._get_session()
-            async with session.get(url, headers={"Accept": "application/x-chess-pgn"}) as resp:
-                if resp.status == 200:
-                    text = await resp.text()
-                    logger.debug(f"get_round_pgn({round_id}): {len(text)} chars")
-                    return text
-                body = await resp.text()
-                logger.warning(f"get_round_pgn({round_id}): HTTP {resp.status} → {body[:200]}")
-                return None
+            async with session.get(
+                url,
+                params=params,
+                headers={"Accept": "application/x-ndjson", **self._auth_headers()},
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning("my-rounds HTTP %s", resp.status)
+                    return []
+                text = await resp.text()
+                for line in text.splitlines():
+                    if len(out) >= nb:
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        out.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
         except Exception as e:
-            logger.error(f"get_round_pgn({round_id}) error: {e}", exc_info=True)
-            return None
+            logger.error("get_my_broadcast_rounds: %s", e, exc_info=True)
+        return out
 
-    # ── Lichess Cloud Eval ────────────────────────────────────────────────────
+    # --- Cloud eval ---
 
     async def cloud_eval(self, fen: str, multi_pv: int = 3) -> dict | None:
-        """
-        GET /api/cloud-eval?fen=<fen>&multiPv=<n>
-
-        Returns cached Stockfish analysis. Returns None on cache miss (HTTP 404).
-
-        Response (200):
-        {
-          "fen": "...",
-          "knodes": 45000,
-          "depth": 24,
-          "pvs": [
-            { "moves": "e2e4 e7e5 g1f3", "cp": 30 },   ← centipawns, white POV
-            { "moves": "d2d4 d7d5", "cp": 15 },
-            { "moves": "c2c4 e7e5", "mate": 3 }         ← forced mate
-          ]
-        }
-        cp is always from white's perspective.
-        """
         params = {"fen": fen, "multiPv": str(multi_pv)}
         try:
             session = await self._get_session()
             async with session.get(
-                LICHESS_CLOUD_EVAL_URL,
+                self.cloud_eval_url,
                 params=params,
                 headers={"Accept": "application/json"},
             ) as resp:
                 if resp.status == 200:
                     return await resp.json()
                 if resp.status == 404:
-                    logger.debug("cloud_eval: position not in cache (404)")
+                    logger.debug("cloud_eval: cache miss (404)")
                     return None
-                logger.warning(f"cloud_eval: HTTP {resp.status}")
+                logger.warning("cloud_eval: HTTP %s", resp.status)
                 return None
         except asyncio.TimeoutError:
             logger.warning("cloud_eval: timed out")
             return None
         except Exception as e:
-            logger.error(f"cloud_eval error: {e}")
+            logger.error("cloud_eval error: %s", e)
             return None

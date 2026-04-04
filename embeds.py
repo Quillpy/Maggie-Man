@@ -1,7 +1,9 @@
 # Discord embed builders for Maggie Man bot.
 
+from datetime import datetime, timezone
+
 import discord
-from datetime import datetime
+
 from chess_engine import format_eval, get_winning_side
 
 
@@ -61,7 +63,7 @@ def build_move_embed(
         title=title,
         description=commentary,
         color=cfg["color"],
-        timestamp=datetime.utcnow()
+        timestamp=datetime.now(timezone.utc),
     )
 
     embed.add_field(
@@ -110,7 +112,7 @@ def build_round_start_embed(
         title=f"🏁 {round_name} — STARTED!",
         description=commentary,
         color=0x5865F2,
-        timestamp=datetime.utcnow()
+        timestamp=datetime.now(timezone.utc),
     )
 
     pairings_text = ""
@@ -125,25 +127,31 @@ def build_round_start_embed(
     )
 
     if broadcast_url:
-        embed.add_field(name="📺 Watch Live", value=f"[FIDE Candidates 2026]({broadcast_url})", inline=False)
+        embed.add_field(name="📺 Watch live", value=f"[Broadcast]({broadcast_url})", inline=False)
 
-    embed.set_footer(text="Maggie Man • FIDE Candidates 2026 Tracker")
+    embed.set_footer(text="Maggie Man • Broadcast tracker")
     return embed
 
 
-def build_reminder_embed(round_name: str, minutes: int, commentary: str) -> discord.Embed:
+def build_reminder_embed(
+    round_name: str,
+    minutes: int,
+    commentary: str,
+    broadcast_url: str = "",
+) -> discord.Embed:
     """Build embed for pre-round reminder."""
     embed = discord.Embed(
         title=f"⏰ {round_name} starts in {minutes} minutes!",
         description=commentary,
         color=0xFF8C00,
-        timestamp=datetime.utcnow()
+        timestamp=datetime.now(timezone.utc),
     )
-    embed.add_field(
-        name="📺 Tournament",
-        value="[FIDE Candidates 2026](https://lichess.org/broadcast/fide-candidates-2026--combined-open--women/OqKQ3sJH)",
-        inline=False
-    )
+    if broadcast_url:
+        embed.add_field(
+            name="📺 Broadcast",
+            value=f"[Watch on Lichess]({broadcast_url})",
+            inline=False,
+        )
     embed.set_footer(text="Maggie Man • Don't miss it")
     return embed
 
@@ -172,10 +180,10 @@ def build_game_over_embed(
         title=f"{emoji} Game Over — {board_str}{white} vs {black}",
         description=f"**Result:** `{result}` | **Moves:** {total_moves}",
         color=0x808080,
-        timestamp=datetime.utcnow()
+        timestamp=datetime.now(timezone.utc),
     )
     if result != "1/2-1/2":
         embed.add_field(name="🏆 Winner", value=winner, inline=True)
     embed.add_field(name="🎯 Round", value=round_name, inline=True)
-    embed.set_footer(text="Maggie Man • FIDE Candidates 2026")
+    embed.set_footer(text="Maggie Man")
     return embed

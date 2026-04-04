@@ -1,156 +1,192 @@
 """
-Diagnostic script — run this BEFORE starting the bot.
+Pre-flight checks. Does not import bot settings (so you can run without Discord env).
 Usage: python diagnose.py
 """
 
+from __future__ import annotations
+
 import asyncio
-import aiohttp
-import json
+import os
 import re
 
-CANDIDATES_BROADCAST_ID = "OqKQ3sJH"
-LICHESS_API_BASE = "https://lichess.org/api"
-LICHESS_CLOUD_EVAL_URL = "https://lichess.org/api/cloud-eval"
+import aiohttp
+from dotenv import load_dotenv
+
+load_dotenv()
+
+LICHESS_API_BASE = os.getenv("LICHESS_API_BASE", "https://lichess.org/api").rstrip("/")
+LICHESS_CLOUD_EVAL_URL = f"{LICHESS_API_BASE}/cloud-eval"
 CHESS_API_URL = "https://chess-api.com/v1"
 TEST_FEN = "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3"
+MONITORED_BROADCAST_ID = os.getenv("MONITORED_BROADCAST_ID", "OqKQ3sJH").strip()
 
 
-async def check_lichess_broadcast():
-    print("\n[1] Lichess Broadcast Tournament + Rounds")
-    url = f"{LICHESS_API_BASE}/broadcast/{CANDIDATES_BROADCAST_ID}"
+async def check_lichess_broadcast() -> None:
+    print("\n[1] Lichess broadcast tournament + rounds")
+    url = f"{LICHESS_API_BASE}/broadcast/{MONITORED_BROADCAST_ID}"
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.get(url, headers={"Accept": "application/json"},
-                             timeout=aiohttp.ClientTimeout(total=10)) as r:
+            async with s.get(
+                url,
+                headers={"Accept": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as r:
                 print(f"    HTTP {r.status}  →  {url}")
                 if r.status == 200:
                     data = await r.json()
                     tour = data.get("tour", {})
                     rounds = data.get("rounds", [])
-                    print(f"    ✅ Tournament: {tour.get('name', '?')}")
-                    print(f"    ✅ Rounds: {len(rounds)}")
+                    print(f"    OK Tournament: {tour.get('name', '?')}")
+                    print(f"    OK Rounds: {len(rounds)}")
                     active_round_id = None
                     for rd in rounds:
-                        ongoing  = rd.get("ongoing", False)
+                        ongoing = rd.get("ongoing", False)
                         finished = rd.get("finished", False)
-                        starts   = rd.get("startsAt", "")
-                        status = "🟢 LIVE" if ongoing else ("✅ done" if finished else "⏳ upcoming")
-                        print(f"       {status}  {rd.get('name','?'):15s}  id={rd.get('id')}  startsAt={starts}")
+                        starts = rd.get("startsAt", "")
+                        status = "LIVE" if ongoing else ("done" if finished else "upcoming")
+                        print(
+                            f"       {status:8}  {rd.get('name', '?'):15}  id={rd.get('id')}  startsAt={starts}"
+                        )
                         if ongoing and not finished:
                             active_round_id = rd.get("id")
                     if active_round_id:
                         await check_round_pgn(active_round_id)
                     else:
-                        print("\n    ℹ️  No round currently live (between rounds or tournament not started)")
+                        print("\n    No round marked ongoing right now (normal between rounds).")
                 else:
                     body = await r.text()
-                    print(f"    ❌ {body[:300]}")
+                    print(f"    FAIL {body[:300]}")
     except Exception as e:
-        print(f"    ❌ Exception: {e}")
+        print(f"    FAIL {e}")
 
 
-async def check_round_pgn(round_id: str):
+async def check_round_pgn(round_id: str) -> None:
     print(f"\n[2] Round PGN  (round_id={round_id})")
     url = f"{LICHESS_API_BASE}/broadcast/round/{round_id}.pgn"
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.get(url, headers={"Accept": "application/x-chess-pgn"},
-                             timeout=aiohttp.ClientTimeout(total=10)) as r:
+            async with s.get(
+                url,
+                headers={"Accept": "application/x-chess-pgn"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as r:
                 print(f"    HTTP {r.status}  →  {url}")
                 if r.status == 200:
                     text = await r.text()
-                    games = [g for g in re.split(r'\n\n(?=\[)', text.strip()) if g.strip()]
-                    fens  = re.findall(r'\[%fen ([^\]]+)\]', text)
-                    print(f"    ✅ {len(games)} games, {len(fens)} FEN annotations, {len(text)} chars")
-                    if games:
-                        hdrs = dict(re.findall(r'\[(\w+)\s+"([^"]*)"\]', games[0]))
-                        print(f"       Sample game: {hdrs.get('White','?')} vs {hdrs.get('Black','?')}  Board={hdrs.get('Board','?')}")
-                    if fens:
-                        print(f"       Last FEN: {fens[-1][:70]}")
+                    games = [g for g in re.split(r"\n\n(?=\[)", text.strip()) if g.strip()]
+                    fens = re.findall(r"\[%fen ([^\]]+)\]", text)
+                    print(f"    OK {len(games)} games, {len(fens)} FEN tags, {len(text)} chars")
                 else:
                     body = await r.text()
-                    print(f"    ❌ {body[:200]}")
+                    print(f"    FAIL {body[:200]}")
     except Exception as e:
-        print(f"    ❌ Exception: {e}")
+        print(f"    FAIL {e}")
 
 
-async def check_cloud_eval():
-    print(f"\n[3] Lichess Cloud Eval")
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(LICHESS_CLOUD_EVAL_URL,
-                             params={"fen": TEST_FEN, "multiPv": "3"},
-                             headers={"Accept": "application/json"},
-                             timeout=aiohttp.ClientTimeout(total=10)) as r:
-                print(f"    HTTP {r.status}")
-                if r.status == 200:
-                    data = await r.json()
-                    pvs = data.get("pvs", [])
-                    print(f"    ✅ depth={data.get('depth','?')}, {len(pvs)} PV(s)")
-                    for i, pv in enumerate(pvs):
-                        cp   = pv.get("cp")
-                        mate = pv.get("mate")
-                        score = f"mate {mate}" if mate is not None else f"{cp/100:+.2f}"
-                        print(f"       PV{i+1}: {score}  {pv.get('moves','')[:50]}")
-                elif r.status == 404:
-                    print("    ℹ️  Position not in cache (normal for rare positions)")
-                else:
-                    print(f"    ❌ HTTP {r.status}")
-    except Exception as e:
-        print(f"    ❌ Exception: {e}")
-
-
-async def check_chess_api():
-    print(f"\n[4] chess-api.com Fallback")
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.post(CHESS_API_URL, json={"fen": TEST_FEN, "depth": 12},
-                              timeout=aiohttp.ClientTimeout(total=15)) as r:
-                print(f"    HTTP {r.status}")
-                if r.status == 200:
-                    d = await r.json()
-                    print(f"    ✅ type={d.get('type')} eval={d.get('eval')} move={d.get('san')} depth={d.get('depth')}")
-                else:
-                    print(f"    ❌ HTTP {r.status}")
-    except Exception as e:
-        print(f"    ❌ Exception: {e}")
-
-
-async def check_discord():
-    print(f"\n[5] Discord Channel + Bot Token")
-    from config import DISCORD_BOT_TOKEN, DISCORD_CHESS_CHANNEL_ID
+async def check_broadcast_search() -> None:
+    print("\n[3] Broadcast search API")
+    url = f"{LICHESS_API_BASE}/broadcast/search"
     try:
         async with aiohttp.ClientSession() as s:
             async with s.get(
-                f"https://discord.com/api/v10/channels/{DISCORD_CHESS_CHANNEL_ID}",
-                headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"},
-                timeout=aiohttp.ClientTimeout(total=10)) as r:
+                url,
+                params={"q": "candidates", "page": 1},
+                headers={"Accept": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as r:
+                print(f"    HTTP {r.status}")
+                if r.status == 200:
+                    data = await r.json()
+                    n = len(data.get("currentPageResults") or [])
+                    print(f"    OK {n} result(s) on page 1")
+                else:
+                    print(f"    FAIL {await r.text()[:200]}")
+    except Exception as e:
+        print(f"    FAIL {e}")
+
+
+async def check_cloud_eval() -> None:
+    print(f"\n[4] Lichess cloud-eval")
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
+                LICHESS_CLOUD_EVAL_URL,
+                params={"fen": TEST_FEN, "multiPv": "3"},
+                headers={"Accept": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as r:
+                print(f"    HTTP {r.status}")
+                if r.status == 200:
+                    data = await r.json()
+                    print(f"    OK depth={data.get('depth', '?')}")
+                elif r.status == 404:
+                    print("    OK (404 cache miss is normal)")
+                else:
+                    print(f"    FAIL")
+    except Exception as e:
+        print(f"    FAIL {e}")
+
+
+async def check_chess_api() -> None:
+    print(f"\n[5] chess-api.com fallback")
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(
+                CHESS_API_URL,
+                json={"fen": TEST_FEN, "depth": 12},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as r:
                 print(f"    HTTP {r.status}")
                 if r.status == 200:
                     d = await r.json()
-                    print(f"    ✅ Channel: #{d.get('name')} (guild {d.get('guild_id')})")
-                elif r.status == 401:
-                    print("    ❌ Invalid bot token")
-                elif r.status == 403:
-                    print("    ❌ Bot lacks permission to view this channel")
-                elif r.status == 404:
-                    print("    ❌ Channel not found — check DISCORD_CHESS_CHANNEL_ID")
+                    print(f"    OK eval={d.get('eval')} move={d.get('san')}")
                 else:
-                    print(f"    ❌ HTTP {r.status}")
+                    print("    FAIL")
     except Exception as e:
-        print(f"    ❌ Exception: {e}")
+        print(f"    FAIL {e}")
 
 
-async def main():
+async def check_discord() -> None:
+    print(f"\n[6] Discord (optional)")
+    token = os.getenv("DISCORD_BOT_TOKEN", "").strip()
+    channel_id = os.getenv("DISCORD_CHESS_CHANNEL_ID", "").strip()
+    if not token or not channel_id:
+        print("    SKIP set DISCORD_BOT_TOKEN and DISCORD_CHESS_CHANNEL_ID in .env")
+        return
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
+                f"https://discord.com/api/v10/channels/{channel_id}",
+                headers={"Authorization": f"Bot {token}"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as r:
+                print(f"    HTTP {r.status}")
+                if r.status == 200:
+                    d = await r.json()
+                    print(f"    OK #{d.get('name')} (guild {d.get('guild_id')})")
+                elif r.status == 401:
+                    print("    FAIL invalid bot token")
+                elif r.status == 403:
+                    print("    FAIL missing access to channel")
+                elif r.status == 404:
+                    print("    FAIL channel id wrong")
+                else:
+                    print("    FAIL")
+    except Exception as e:
+        print(f"    FAIL {e}")
+
+
+async def main() -> None:
     print("=" * 60)
-    print("  Maggie Man Bot — Pre-flight Diagnostics")
+    print("  Maggie Man — diagnostics")
     print("=" * 60)
     await check_lichess_broadcast()
+    await check_broadcast_search()
     await check_cloud_eval()
     await check_chess_api()
     await check_discord()
     print("\n" + "=" * 60)
-    print("  Done. Fix any ❌ before running bot.py")
+    print("  Done.")
     print("=" * 60)
 
 

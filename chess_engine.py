@@ -22,17 +22,17 @@ def _cp_to_pawns(cp: int | float) -> float:
 
 def classify_move(cp_before: float | None, cp_after: float | None,
                   turn_before: str) -> str:
-    """
-    Classify a move based on centipawn change.
+    
+    # Classify a move based on centipawn change.
 
-    cp_before / cp_after: eval in PAWNS from white's POV.
-    turn_before: 'w' (white just moved) or 'b' (black just moved).
+    #cp_before / cp_after: eval in PAWNS from white's POV.
+    #turn_before: 'w' (white just moved) or 'b' (black just moved).
 
-    A white move is good if cp goes UP (white gains advantage).
-    A black move is good if cp goes DOWN (black gains advantage).
-    """
-    if cp_before is None or cp_after is None:
-        return "unknown"
+    # A white move is good if cp goes UP (white gains advantage).
+    #A black move is good if cp goes DOWN (black gains advantage).
+    
+    # if cp_before is None or cp_after is None:
+        #return "unknown"
 
     # Convert to moving-side delta: positive = moving side gained
     if turn_before == "w":

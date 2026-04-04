@@ -1,107 +1,122 @@
-# ♟️ Maggie Man — FIDE Candidates 2026 Discord Bot
+# Maggie Man — Discord chess broadcast bot
 
-> *"I'm Maggie Man, rated 2800+. These candidates are basically playing checkers."*
+Python bot that watches a [Lichess](https://lichess.org) **broadcast tournament**, posts round reminders and start announcements in a Discord channel, and calls out big swings (blunders / mistakes / brilliancies) with short AI blurbs via [Groq](https://groq.com/). It also exposes slash commands that wrap the public **Lichess Broadcasts** HTTP API ([docs](https://lichess.org/api#tag/broadcasts)).
 
-A parody of Magnus Carlsen who watches the FIDE Candidates 2026 tournament, roasts players on blunders, and sends critical move alerts to your Discord server.
+There is **no follow/unfollow** flow: everyone sees updates in the configured channel automatically.
 
----
+## Features
 
-## Quick Start
+- **Automatic channel updates** for one configured broadcast: pre-round reminders, round start + pairings, move alerts, game over.
+- **`/lichess search`** — uses [`GET /api/broadcast/search`](https://lichess.org/api#tag/broadcasts/GET/api/broadcast/search) (time control, dates, links come from Lichess `tour.info` / `dates`).
+- **Slash helpers** for the other read-only broadcast endpoints (tournament JSON, round JSON, top feed, official feed, players, team standings, PGN export URLs, optional OAuth “my rounds”).
+- **`/maggie`** — casual, sarcastic chat via Groq (same API key as commentary).
+- **Configuration** via `.env` (no `config.py`).
 
-```bash
-# 1. Install dependencies
-pip install -r requirements.txt
+## Requirements
 
-# 2. Verify everything works (run this first!)
-python diagnose.py
+- Python **3.10+** (tested with 3.10–3.12+).
+- A [Discord application + bot](https://discord.com/developers/applications) with the **Message Content Intent** enabled (used for prefix commands if you add them later; slash commands work regardless).
+- [Groq API key](https://console.groq.com/).
+- Bot **Send Messages** and **Embed Links** in the target channel.
 
-# 3. Start the bot
-python bot.py
-```
+## Local setup
 
----
+1. Clone the repo and create a virtualenv (optional but recommended).
 
-## Slash Commands
+   ```bash
+   cd Python-Bot
+   python -m venv .venv
+   source .venv/bin/activate   # Windows: .venv\Scripts\activate
+   pip install -r requirements.txt
+   ```
 
-| Command | Description |
-|---|---|
-| `/follow` | Subscribe to tournament alerts (reminders, round starts, move alerts) |
-| `/unfollow` | Unsubscribe |
-| `/status` | Show monitor status (active round, games tracked, moves analysed) |
-| `/maggie <question>` | Ask Maggie Man anything about chess |
+2. Copy `.env.example` to `.env` and fill in values (see table below).
 
----
+3. Sanity-check APIs (optional):
 
-## What the Bot Does
+   ```bash
+   python diagnose.py
+   ```
 
-```
-Every 2 minutes:
-  → Fetch Lichess broadcast rounds list (NDJSON)
-  → If round starts in ≤60min and not reminded yet → send @follower reminder
-  → If round just started (ongoing=true) → send pairings embed with Maggie Man intro
+4. Run the bot:
 
-Every 10 seconds (while a round is active):
-  → Fetch full round PGN (all 16 games in one request)
-  → Parse each game's moves and FEN annotations
-  → For each game where move count increased:
-      → Query Lichess Cloud Eval API (/api/cloud-eval?fen=...&multiPv=3)
-      → Falls back to chess-api.com if position not cached
-      → Compute centipawn delta → classify move
-      → If blunder / mistake / brilliancy:
-          → Send to Groq → Maggie Man roast commentary
-          → Post Discord embed with analysis
-  → When a game finishes → post result embed
-```
+   ```bash
+   python bot.py
+   ```
 
----
+### Environment variables
 
-## Move Classification
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `DISCORD_BOT_TOKEN` | yes | Bot token from the Discord Developer Portal. |
+| `DISCORD_CHESS_CHANNEL_ID` | yes | Numeric ID of the text channel for tournament posts. |
+| `GROQ_API_KEY` | yes | Groq API key. |
+| `GROQ_MODEL` | no | Chat model id (default `openai/gpt-oss-120b`). |
+| `MONITORED_BROADCAST_ID` | no | 8-character Lichess **broadcast tournament** id to watch (default: FIDE Candidates combined example). |
+| `MONITORED_BROADCAST_URL` | no | Public Lichess URL for that broadcast (used in embeds). |
+| `LICHESS_API_BASE` | no | Default `https://lichess.org/api`. |
+| `LICHESS_SITE_BASE` | no | Default `https://lichess.org` (for `/broadcast/.../players` paths). |
+| `LICHESS_API_TOKEN` | no | OAuth bearer with `study:read` for `/lichess my_rounds` and richer private data on `/lichess by_user`. |
+| `POLL_INTERVAL_SECONDS` | no | How often to poll the active round PGN (default `10`). |
+| `REMINDER_MINUTES_BEFORE` | no | Send a reminder when the round starts within this many minutes (default `60`). |
+| `ROUND_CHECK_INTERVAL_SECONDS` | no | How often to refresh the rounds list (default `120`). |
 
-| Class | CP Drop (moving side) | Alerted? |
-|---|---|---|
-| Brilliancy | gains ≥ 150cp | ✅ Yes |
-| Blunder | loses ≥ 200cp | ✅ Yes |
-| Mistake | loses ≥ 100cp | ✅ Yes |
-| Inaccuracy | loses ≥ 50cp | ❌ No |
-| Good | < 50cp drop | ❌ No |
+**Security:** never commit `.env` or paste tokens into code. If tokens were ever committed, **rotate them** in Discord and Groq.
 
----
+## Slash commands
 
-## Architecture
+| Command | Purpose |
+|---------|---------|
+| `/status` | Monitor stats (broadcast id, active round, move count). |
+| `/maggie` | Ask the bot something (short, sarcastic replies). |
+| `/lichess search` | Search broadcasts by text (`q`, `page`). |
+| `/lichess tournament` | `GET /api/broadcast/{id}` — full tournament + rounds. |
+| `/lichess top` | `GET /api/broadcast/top` — page 1 = active list; page 2+ uses the paginated `past` object. |
+| `/lichess official` | `GET /api/broadcast?nb=…` — official NDJSON feed (first N tournaments). |
+| `/lichess round` | `GET /api/broadcast/-/-/{roundId}` — round JSON + games. |
+| `/lichess players` | `GET /broadcast/{id}/players` |
+| `/lichess player` | `GET /broadcast/{id}/players/{playerId}` |
+| `/lichess standings` | `GET /broadcast/{id}/teams/standings` |
+| `/lichess by_user` | `GET /api/broadcast/by/{username}` |
+| `/lichess pgn` | Prints URLs for `GET /api/broadcast/round/{id}.pgn`, `GET /api/stream/broadcast/round/{id}.pgn`, and/or `GET /api/broadcast/{id}.pgn`. |
+| `/lichess my_rounds` | `GET /api/broadcast/my-rounds` (needs `LICHESS_API_TOKEN`, ephemeral). |
 
-```
-bot.py                ← Discord bot, slash commands, on_ready startup
-├── monitor.py        ← Core engine: round-check loop + game poll loop
-├── lichess_client.py ← Lichess API (broadcast rounds NDJSON, round PGN, cloud eval)
-├── pgn_parser.py     ← Extracts games, moves, FEN annotations from PGN
-├── chess_engine.py   ← Eval parsing, move classification, chess-api.com fallback
-├── groq_commentary.py← Groq AI (Maggie Man personality + commentary generation)
-├── embeds.py         ← Discord embed builders (move alerts, round start, reminders)
-└── config.py         ← All keys and constants
-```
+The client also implements `stream_round_pgn_lines()` for live PGN streaming; the bot does not keep a permanent stream open (use the URL from `/lichess pgn` or integrate yourself).
 
----
+## Deploy on Railway
 
-## APIs Used
+Railway runs a **long-lived process** (no HTTP port required for a Discord bot).
 
-| API | Auth | Purpose |
-|---|---|---|
-| `lichess.org/api/broadcast/{id}/rounds` | None | Round list (NDJSON) |
-| `lichess.org/api/broadcast/round/{id}.pgn` | None | Game PGN with FEN annotations |
-| `lichess.org/api/cloud-eval` | None | Stockfish cloud eval (primary) |
-| `chess-api.com/v1` | None | Stockfish REST fallback |
-| Groq (`openai/gpt-oss-120b`) | API Key | Maggie Man commentary |
-| Discord | Bot Token | Messages + slash commands |
+1. Push this repo to GitHub (or connect the folder) and create a **New Project** → **Deploy from GitHub** (or CLI).
 
----
+2. Set **Variables** in the Railway service to match your `.env` (at minimum `DISCORD_BOT_TOKEN`, `DISCORD_CHESS_CHANNEL_ID`, `GROQ_API_KEY`).
 
-## Bug Fixes (v2)
+3. **Start command:** `python bot.py`  
+   The included `railway.json` sets this for Nixpacks. Railway will detect Python, install `requirements.txt`, and run the start command.
 
-- **Fixed**: `asyncio.get_event_loop()` → `asyncio.get_running_loop()` (tasks now actually start)
-- **Fixed**: Broadcast rounds response parsed as NDJSON not JSON array
-- **Fixed**: Round field names (`ongoing` not `started`) from Lichess API
-- **Fixed**: Analysis switched from chess-api.com primary → Lichess Cloud Eval primary
-- **Fixed**: PGN FEN extraction regex hardened for Lichess comment format
-- **Fixed**: `classify_move()` centipawn delta direction bug
-- **Added**: `diagnose.py` pre-flight check script
-# Maggie-Man
+4. **Scaling:** use **one** replica. Two processes with the same bot token will fight for the connection.
+
+5. **Logs:** open the **Deployments → View logs** tab; Python logs show sync errors, Lichess HTTP issues, and Groq failures.
+
+6. **Free tier / sleep:** if the host sleeps, the bot goes offline until the process restarts. Use a paid/worker-friendly plan if you need always-on.
+
+### Optional: Dockerfile
+
+If you prefer Docker instead of Nixpacks, you can add your own `Dockerfile` that copies the project, runs `pip install -r requirements.txt`, and sets `CMD ["python", "bot.py"]`. The repo ships Nixpacks + `railway.json` only.
+
+## How monitoring works
+
+1. Every `ROUND_CHECK_INTERVAL_SECONDS`, the bot loads `GET /api/broadcast/{MONITORED_BROADCAST_ID}` and inspects each round’s `startsAt`, `ongoing`, and `finished` flags.
+2. When a round goes live, it downloads `GET /api/broadcast/round/{roundId}.pgn`, parses games (Lichess embeds `[%fen …]` comments), and tracks new moves.
+3. Evaluations use Lichess **cloud eval** when cached, otherwise a fallback HTTP engine (`chess_engine.py`).
+4. Notable classifications trigger Groq commentary and a Discord embed.
+
+## References
+
+- [Lichess API — Broadcasts](https://lichess.org/api#tag/broadcasts)
+- [Broadcast search](https://lichess.org/api#tag/broadcasts/GET/api/broadcast/search)
+- [Discord.py documentation](https://discordpy.readthedocs.io/)
+
+## License
+
+Follow the license of the upstream repository you received this code in (add a `LICENSE` file if none exists).
