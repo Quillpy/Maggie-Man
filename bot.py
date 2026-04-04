@@ -1,11 +1,9 @@
 from __future__ import annotations
-
 import logging
 import discord
 from discord import app_commands
 from discord.ext import commands
 from groq import Groq
-
 import settings
 from broadcast_ui import (
     embed_broadcast_round,
@@ -23,7 +21,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("maggie-man")
-
 intents = discord.Intents.default()
 intents.message_content = True
 
@@ -32,7 +29,6 @@ You're Maggie Man — sarcastic, casual, a bit smug (Magnus parody).
 Answer in plain English, short. Dry jokes welcome. No lectures, no fake grandeur.
 Chess talk only; don't be mean about real-world traits. If you don't know, say so.
 """
-
 
 class MaggieBot(commands.Bot):
     def __init__(self) -> None:
@@ -56,7 +52,6 @@ lichess_group = app_commands.Group(
     name="lichess",
     description="Lichess broadcast tools (see https://lichess.org/api#tag/broadcasts)",
 )
-
 
 @bot.event
 async def on_ready() -> None:
