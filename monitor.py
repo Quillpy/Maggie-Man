@@ -1,39 +1,30 @@
-"""
-Tournament monitor — polls the configured Lichess broadcast and posts to Discord.
-
-Flow:
-1. Every ROUND_CHECK_INTERVAL_SECONDS: fetch rounds for MONITORED_BROADCAST_ID
-2. Reminders and round-start posts go to the chess channel (no per-user follow list)
-3. Poll active round PGN every POLL_INTERVAL_SECONDS; classify moves; post alerts
-"""
-
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import discord
 
+import board_follow_storage
+import follow_storage
+from pairings import format_pairings_text, pairings_from_pgn
 from chess_engine import (
     classify_move,
+    evaluate_with_chess_api,
     format_eval,
     get_winning_side,
     is_alert_worthy,
     parse_cloud_eval,
-    evaluate_with_chess_api,
+    summarize_cloud_eval_for_prompt,
 )
-from embeds import (
-    build_game_over_embed,
-    build_move_embed,
-    build_reminder_embed,
-    build_round_start_embed,
-)
+from embeds import build_move_embed, build_reminder_embed
 from groq_commentary import (
+    generate_follow_board_commentary,
     generate_move_commentary,
     generate_reminder_message,
-    generate_round_start_message,
 )
 from lichess_client import LichessClient
 from pgn_parser import (
@@ -81,12 +72,15 @@ class TournamentMonitor:
         channel_id: int,
         groq_api_key: str,
         lichess_client: LichessClient | None = None,
+        initial_broadcast_id: str | None = None,
+        initial_broadcast_url: str | None = None,
     ):
         self.bot = bot
         self.channel_id = channel_id
         self.groq_api_key = groq_api_key
-        self.broadcast_id = settings.MONITORED_BROADCAST_ID
-        self.broadcast_url = settings.MONITORED_BROADCAST_URL
+        self.broadcast_id = (initial_broadcast_id or "").strip() or None
+        self.broadcast_url = (initial_broadcast_url or "").strip() or ""
+
         self.lichess = lichess_client or LichessClient(
             api_base=settings.LICHESS_API_BASE,
             cloud_eval_url=settings.LICHESS_CLOUD_EVAL_URL,
@@ -98,16 +92,43 @@ class TournamentMonitor:
         self.active_round_id: str | None = None
         self._running = False
         self._moves_analysed = 0
+        self.followed_board_number: int | None = board_follow_storage.load_followed_board()
 
         self._poll_task: asyncio.Task | None = None
         self._round_check_task: asyncio.Task | None = None
+
+    def set_follow(self, broadcast_id: str, broadcast_url: str) -> None:
+        self.broadcast_id = broadcast_id.strip()
+        self.broadcast_url = (broadcast_url or "").strip()
+        self.rounds.clear()
+        self.active_round_id = None
+        self._moves_analysed = 0
+        logger.info("Now following broadcast %s", self.broadcast_id)
+
+    def clear_follow(self) -> None:
+        self.broadcast_id = None
+        self.broadcast_url = ""
+        self.rounds.clear()
+        self.active_round_id = None
+
+    def set_followed_board(self, board_number: int | None) -> None:
+        self.followed_board_number = board_number
+        board_follow_storage.save_followed_board(board_number)
+        logger.info("Follow-board set to %s", board_number or "off")
+
+    def clear_all_follow_state(self) -> None:
+        self.clear_follow()
+        self.followed_board_number = None
+        self._moves_analysed = 0
+        follow_storage.clear_followed()
+        board_follow_storage.clear_followed_board_file()
+        logger.info("Cleared all follow state (broadcast + board)")
 
     def start(self) -> None:
         self._running = True
         loop = asyncio.get_running_loop()
         self._round_check_task = loop.create_task(self._round_check_loop())
         self._poll_task = loop.create_task(self._poll_loop())
-        logger.info("Monitor tasks started (round check + game poll)")
 
     def stop(self) -> None:
         self._running = False
@@ -125,7 +146,10 @@ class TournamentMonitor:
             "rounds_tracked": len(self.rounds),
             "moves_analysed": self._moves_analysed,
             "active_round": self.active_round_id,
-            "broadcast_id": self.broadcast_id,
+            "broadcast_id": self.broadcast_id or "—",
+            "broadcast_url": self.broadcast_url or "—",
+            "following": bool(self.broadcast_id),
+            "followed_board": self.followed_board_number,
         }
 
     async def _round_check_loop(self) -> None:
@@ -138,15 +162,17 @@ class TournamentMonitor:
             await asyncio.sleep(settings.ROUND_CHECK_INTERVAL_SECONDS)
 
     async def _check_rounds(self) -> None:
+        if not self.broadcast_id:
+            return
+
         rounds = await self.lichess.get_broadcast_rounds(self.broadcast_id)
         if not rounds:
-            logger.warning("_check_rounds: empty rounds for broadcast %s", self.broadcast_id)
+            logger.debug("No rounds for broadcast %s", self.broadcast_id)
             return
 
         now = datetime.now(timezone.utc)
 
-        for r in rounds:
-            round_info = r
+        for round_info in rounds:
             round_id = round_info.get("id")
             if not round_id:
                 continue
@@ -160,17 +186,10 @@ class TournamentMonitor:
             if start_ts:
                 try:
                     start_time = datetime.fromtimestamp(int(start_ts) / 1000, tz=timezone.utc)
-                except Exception as e:
-                    logger.warning("Could not parse startsAt=%s: %s", start_ts, e)
+                except (ValueError, TypeError, OSError) as e:
+                    logger.warning("startsAt=%s: %s", start_ts, e)
 
             if round_id not in self.rounds:
-                logger.info(
-                    "Discovered round: %s (id=%s, started=%s, finished=%s)",
-                    round_name,
-                    round_id,
-                    started,
-                    finished,
-                )
                 self.rounds[round_id] = RoundState(
                     round_id=round_id,
                     round_name=round_name,
@@ -178,6 +197,7 @@ class TournamentMonitor:
                 )
 
             state = self.rounds[round_id]
+            state.round_name = round_name
             state.start_time = start_time
 
             if (
@@ -189,33 +209,16 @@ class TournamentMonitor:
                 secs_until = (start_time - now).total_seconds()
                 if 0 < secs_until <= settings.REMINDER_MINUTES_BEFORE * 60:
                     state.reminder_sent = True
-                    mins = int(secs_until // 60)
-                    logger.info("Sending reminder for %s (%s min away)", round_name, mins)
-                    await self._send_reminder(round_name, mins)
+                    mins = max(1, int(secs_until // 60))
+                    logger.info("Reminder: %s (~%s min)", round_name, mins)
+                    r_url = (round_info.get("url") or "").strip()
+                    await self._send_reminder(round_id, round_name, mins, r_url)
 
             if started and not finished and not state.start_announced:
                 state.started = True
                 state.start_announced = True
                 self.active_round_id = round_id
-                logger.info("Round started: %s (id=%s)", round_name, round_id)
-
-                pgn = await self.lichess.get_round_pgn(round_id)
-                pairings = []
-                if pgn:
-                    games = parse_pgn_games(pgn)
-                    for i, g in enumerate(games):
-                        try:
-                            board = int(g["headers"].get("Board", i + 1))
-                        except (ValueError, TypeError):
-                            board = i + 1
-                        pairings.append(
-                            {
-                                "white": g["white"],
-                                "black": g["black"],
-                                "board": board,
-                            }
-                        )
-                await self._send_round_start(round_name, pairings)
+                logger.info("Round live: %s (%s)", round_name, round_id)
 
             if started and not finished:
                 self.active_round_id = round_id
@@ -224,16 +227,17 @@ class TournamentMonitor:
         await asyncio.sleep(5)
         while self._running:
             try:
-                if self.active_round_id:
+                if self.broadcast_id and self.active_round_id:
                     await self._poll_active_round()
-                else:
-                    logger.debug("_poll_loop: no active round yet")
             except Exception as e:
-                logger.error("Poll loop error: %s", e, exc_info=True)
+                logger.error("Poll error: %s", e, exc_info=True)
             await asyncio.sleep(settings.POLL_INTERVAL_SECONDS)
 
     async def _poll_active_round(self) -> None:
         round_id = self.active_round_id
+        if not round_id:
+            return
+
         pgn = await self.lichess.get_round_pgn(round_id)
         if not pgn:
             return
@@ -264,12 +268,6 @@ class TournamentMonitor:
                     black=game["black"],
                     board_number=board_num,
                 )
-                logger.info(
-                    "Tracking new game: Board %s %s vs %s",
-                    board_num,
-                    game["white"],
-                    game["black"],
-                )
 
             gs = round_state.games[game_id]
 
@@ -279,7 +277,6 @@ class TournamentMonitor:
             if is_game_over(game) and game_id not in round_state.finished_game_ids:
                 gs.is_over = True
                 round_state.finished_game_ids.add(game_id)
-                await self._send_game_over(game, gs, round_name)
                 continue
 
             current_move_count = get_move_count(game)
@@ -296,30 +293,46 @@ class TournamentMonitor:
             turn_before = "w" if (current_move_count % 2 == 1) else "b"
             move_number = (current_move_count + 1) // 2
 
+            (eval_after, mate_after, best_move, continuation), cloud_raw = await self._evaluate(
+                latest_fen
+            )
+            self._moves_analysed += 1
+
+            classification = classify_move(gs.last_eval, eval_after, turn_before)
+
             logger.info(
-                "[%s] Board %s %s vs %s | move %s: %s (ply %s)",
+                "[%s] B%s %s vs %s | %s. %s | %s",
                 round_name,
                 board_num,
                 game["white"],
                 game["black"],
                 move_number,
                 last_move_san,
-                current_move_count,
-            )
-
-            eval_after, mate_after, best_move, continuation = await self._evaluate(latest_fen)
-            self._moves_analysed += 1
-
-            classification = classify_move(gs.last_eval, eval_after, turn_before)
-
-            logger.info(
-                "  → eval: %s → %s | %s",
-                format_eval(gs.last_eval, gs.last_mate),
-                format_eval(eval_after, mate_after),
                 classification,
             )
 
-            if is_alert_worthy(classification):
+            follow_board = (
+                self.followed_board_number is not None
+                and board_num == self.followed_board_number
+            )
+
+            if follow_board:
+                await self._send_board_follow_update(
+                    game=game,
+                    gs=gs,
+                    round_name=round_name,
+                    move_san=last_move_san,
+                    move_number=move_number,
+                    classification=classification,
+                    eval_before=gs.last_eval,
+                    eval_after=eval_after,
+                    mate_before=gs.last_mate,
+                    mate_after=mate_after,
+                    best_move=best_move,
+                    continuation=continuation,
+                    cloud_raw=cloud_raw,
+                )
+            elif is_alert_worthy(classification):
                 await self._send_move_alert(
                     game=game,
                     gs=gs,
@@ -339,14 +352,14 @@ class TournamentMonitor:
             gs.last_eval = eval_after
             gs.last_mate = mate_after
 
-    async def _evaluate(self, fen: str) -> tuple:
+    async def _evaluate(
+        self, fen: str
+    ) -> tuple[tuple[float | None, int | None, str, list[str]], dict | None]:
         cloud = await self.lichess.cloud_eval(fen, multi_pv=3)
         if cloud:
-            ev, mate, best, cont = parse_cloud_eval(cloud)
-            return ev, mate, best, cont
-
-        logger.debug("Cloud eval miss — chess-api.com fallback")
-        return await evaluate_with_chess_api(fen)
+            return parse_cloud_eval(cloud), cloud
+        fb = await evaluate_with_chess_api(fen)
+        return fb, None
 
     async def _get_channel(self) -> discord.TextChannel | None:
         channel = self.bot.get_channel(self.channel_id)
@@ -354,33 +367,70 @@ class TournamentMonitor:
             try:
                 channel = await self.bot.fetch_channel(self.channel_id)
             except Exception as e:
-                logger.error("Cannot get channel %s: %s", self.channel_id, e)
+                logger.error("Channel %s: %s", self.channel_id, e)
                 return None
         return channel
 
-    async def _send_reminder(self, round_name: str, minutes: int) -> None:
+    async def _send_reminder(
+        self,
+        round_id: str,
+        round_name: str,
+        minutes: int,
+        round_url: str = "",
+    ) -> None:
         channel = await self._get_channel()
         if not channel:
             return
-        commentary = await generate_reminder_message(
-            round_name, minutes, self.groq_api_key, settings.GROQ_MODEL
-        )
-        embed = build_reminder_embed(
-            round_name, minutes, commentary, self.broadcast_url
-        )
-        await channel.send(embed=embed)
 
-    async def _send_round_start(self, round_name: str, pairings: list[dict]) -> None:
-        channel = await self._get_channel()
-        if not channel:
-            return
-        commentary = await generate_round_start_message(
-            round_name, pairings, self.groq_api_key, settings.GROQ_MODEL
+        tour_name = ""
+        if self.broadcast_id:
+            tour_json = await self.lichess.get_broadcast_tournament(self.broadcast_id)
+            if tour_json:
+                tour_name = (tour_json.get("tour") or {}).get("name") or ""
+
+        pgn = await self.lichess.get_round_pgn(round_id)
+        games, perr = pairings_from_pgn(pgn)
+        pairings_full = format_pairings_text(games) if games else ""
+        if not pairings_full and perr:
+            pairings_full = perr
+
+        excerpt = (pairings_full[:800] if pairings_full else "").strip()
+        commentary = await generate_reminder_message(
+            round_name,
+            minutes,
+            self.groq_api_key,
+            settings.GROQ_MODEL,
+            tournament_name=tour_name,
+            pairings_excerpt=excerpt,
         )
-        embed = build_round_start_embed(
-            round_name, pairings, commentary, self.broadcast_url
+
+        pairings_for_embed: str
+        send_kwargs: dict = {}
+        if games and len(pairings_full) > 900:
+            send_kwargs["file"] = discord.File(
+                io.BytesIO(pairings_full.encode("utf-8")),
+                filename="pairings.txt",
+            )
+            preview = pairings_full[:650] + ("…" if len(pairings_full) > 650 else "")
+            pairings_for_embed = (
+                f"{len(games)} boards — full list in **pairings.txt**.\n{preview}"
+            )
+            if len(pairings_for_embed) > 1020:
+                pairings_for_embed = pairings_for_embed[:1017] + "…"
+        else:
+            pairings_for_embed = pairings_full or ("—" if not perr else perr)
+
+        embed = build_reminder_embed(
+            round_name,
+            minutes,
+            commentary,
+            self.broadcast_url,
+            tournament_name=tour_name,
+            round_url=round_url,
+            pairings_text=pairings_for_embed,
         )
-        await channel.send(embed=embed)
+        send_kwargs["embed"] = embed
+        await channel.send(**send_kwargs)
 
     async def _send_move_alert(
         self,
@@ -401,6 +451,8 @@ class TournamentMonitor:
         if not channel:
             return
 
+        eb = eval_before if eval_before is not None else 0.0
+        ea = eval_after if eval_after is not None else 0.0
         winning_side = get_winning_side(eval_after, mate_after)
         commentary = await generate_move_commentary(
             white=game["white"],
@@ -408,8 +460,8 @@ class TournamentMonitor:
             round_name=round_name,
             move_san=move_san,
             classification=classification,
-            eval_before=eval_before if eval_before is not None else 0.0,
-            eval_after=eval_after if eval_after is not None else 0.0,
+            eval_before=eb,
+            eval_after=ea,
             top_move=best_move,
             continuation=continuation,
             winning_side=winning_side,
@@ -426,8 +478,8 @@ class TournamentMonitor:
             move_san=move_san,
             move_number=move_number,
             classification=classification,
-            eval_before=eval_before if eval_before is not None else 0.0,
-            eval_after=eval_after if eval_after is not None else 0.0,
+            eval_before=eb,
+            eval_after=ea,
             mate_before=mate_before,
             mate_after=mate_after,
             top_move=best_move,
@@ -438,16 +490,77 @@ class TournamentMonitor:
 
         await channel.send(embed=embed)
 
-    async def _send_game_over(self, game: dict, gs: GameState, round_name: str) -> None:
+    async def _send_board_follow_update(
+        self,
+        game,
+        gs,
+        round_name,
+        move_san,
+        move_number,
+        classification,
+        eval_before,
+        eval_after,
+        mate_before,
+        mate_after,
+        best_move,
+        continuation,
+        cloud_raw: dict | None,
+    ) -> None:
         channel = await self._get_channel()
         if not channel:
             return
-        embed = build_game_over_embed(
+
+        eb = eval_before if eval_before is not None else 0.0
+        ea = eval_after if eval_after is not None else 0.0
+        winning_side = get_winning_side(eval_after, mate_after)
+        engine_summary = summarize_cloud_eval_for_prompt(cloud_raw)
+
+        commentary = await generate_follow_board_commentary(
             white=game["white"],
             black=game["black"],
-            result=game["result"],
+            round_name=round_name,
+            move_san=move_san,
+            move_number=move_number,
+            classification=classification,
+            eval_before=format_eval(eval_before, mate_before),
+            eval_after=format_eval(eval_after, mate_after),
+            top_move=best_move,
+            continuation=continuation,
+            winning_side=winning_side,
+            board_number=gs.board_number,
+            engine_summary=engine_summary,
+            groq_api_key=self.groq_api_key,
+            model=settings.GROQ_MODEL,
+        )
+
+        embed = build_move_embed(
+            white=game["white"],
+            black=game["black"],
             round_name=round_name,
             board_number=gs.board_number,
-            total_moves=gs.move_count,
+            move_san=move_san,
+            move_number=move_number,
+            classification=classification,
+            eval_before=eb,
+            eval_after=ea,
+            mate_before=mate_before,
+            mate_after=mate_after,
+            top_move=best_move,
+            continuation=continuation,
+            commentary=commentary,
+            lichess_url=game.get("site", self.broadcast_url),
         )
-        await channel.send(embed=embed)
+        embed.title = f"📌 Board follow — {embed.title}"
+
+        pgn_text = (game.get("raw_pgn") or "").strip()
+        kwargs: dict = {"embed": embed}
+        if len(pgn_text) > 1600:
+            kwargs["file"] = discord.File(
+                io.BytesIO(pgn_text.encode("utf-8")),
+                filename=f"board_{gs.board_number or 'game'}.pgn",
+            )
+            kwargs["content"] = "Current game PGN (attached)."
+        elif pgn_text:
+            kwargs["content"] = f"**PGN**\n```\n{pgn_text}\n```"
+
+        await channel.send(**kwargs)

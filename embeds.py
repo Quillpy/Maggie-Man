@@ -1,33 +1,16 @@
-# Discord embed builders for Maggie Man bot.
-
 from datetime import datetime, timezone
 
 import discord
 
 from chess_engine import format_eval, get_winning_side
 
-
 CLASSIFICATION_CONFIG = {
-    "blunder": {
-        "emoji": "💥",
-        "color": 0xFF0000,
-        "label": "BLUNDER",
-    },
-    "mistake": {
-        "emoji": "😬",
-        "color": 0xFF8C00,
-        "label": "MISTAKE",
-    },
-    "brilliancy": {
-        "emoji": "✨",
-        "color": 0xFFD700,
-        "label": "BRILLIANCY",
-    },
-    "inaccuracy": {
-        "emoji": "🤔",
-        "color": 0xAAAAAA,
-        "label": "INACCURACY",
-    },
+    "blunder": {"emoji": "💥", "color": 0xFF0000, "label": "BLUNDER"},
+    "mistake": {"emoji": "😬", "color": 0xFF8C00, "label": "MISTAKE"},
+    "inaccuracy": {"emoji": "🤔", "color": 0xAAAAAA, "label": "INACCURACY"},
+    "brilliancy": {"emoji": "✨", "color": 0xFFD700, "label": "BRILLIANT"},
+    "great_move": {"emoji": "👍", "color": 0x57F287, "label": "GREAT MOVE"},
+    "good": {"emoji": "♟️", "color": 0x5865F2, "label": "MOVE"},
 }
 
 
@@ -48,16 +31,15 @@ def build_move_embed(
     commentary: str,
     lichess_url: str = "",
 ) -> discord.Embed:
-    """Build the embed for a critical move alert."""
-    cfg = CLASSIFICATION_CONFIG.get(classification, CLASSIFICATION_CONFIG["mistake"])
-    
+    cfg = CLASSIFICATION_CONFIG.get(classification, CLASSIFICATION_CONFIG["good"])
+
     winning = get_winning_side(eval_after, mate_after)
     eval_b_str = format_eval(eval_before, mate_before)
     eval_a_str = format_eval(eval_after, mate_after)
 
-    title = f"{cfg['emoji']} {cfg['label']}! — {white} vs {black}"
+    title = f"{cfg['emoji']} {cfg['label']} — {white} vs {black}"
     if board_number:
-        title = f"{cfg['emoji']} {cfg['label']}! — Board {board_number}: {white} vs {black}"
+        title = f"{cfg['emoji']} {cfg['label']} — Board {board_number}: {white} vs {black}"
 
     embed = discord.Embed(
         title=title,
@@ -66,70 +48,22 @@ def build_move_embed(
         timestamp=datetime.now(timezone.utc),
     )
 
-    embed.add_field(
-        name="♟️ Move Played",
-        value=f"`{move_number}. {move_san}`",
-        inline=True
-    )
-    embed.add_field(
-        name="🔄 Eval Change",
-        value=f"`{eval_b_str}` → `{eval_a_str}`",
-        inline=True
-    )
-    embed.add_field(
-        name="🏆 Best Move",
-        value=f"`{top_move}`",
-        inline=True
-    )
+    embed.add_field(name="Move", value=f"`{move_number}. {move_san}`", inline=True)
+    embed.add_field(name="Eval", value=f"`{eval_b_str}` → `{eval_a_str}`", inline=True)
+    embed.add_field(name="Engine", value=f"`{top_move}`", inline=True)
 
     if continuation:
         cont_str = " ".join(continuation[:5])
-        embed.add_field(
-            name="🔮 Engine Line",
-            value=f"`{cont_str}`",
-            inline=False
-        )
+        embed.add_field(name="Line", value=f"`{cont_str}`", inline=False)
 
-    winning_emoji = {"white": "⬜ White", "black": "⬛ Black", "equal": "⚖️ Equal"}.get(winning, "⚖️ Equal")
-    embed.add_field(name="📊 Position", value=winning_emoji, inline=True)
-    embed.add_field(name="🎯 Round", value=round_name, inline=True)
+    pos = {"white": "White", "black": "Black", "equal": "Equal"}.get(winning, "Equal")
+    embed.add_field(name="Position", value=pos, inline=True)
+    embed.add_field(name="Round", value=round_name, inline=True)
 
     if lichess_url:
-        embed.add_field(name="🔗 Watch Live", value=f"[Lichess]({lichess_url})", inline=True)
+        embed.add_field(name="Watch", value=f"[Lichess]({lichess_url})", inline=True)
 
-    embed.set_footer(text="Maggie Man • 2800+ GM • Stockfish 18 Analysis")
-    return embed
-
-
-def build_round_start_embed(
-    round_name: str,
-    pairings: list[dict],
-    commentary: str,
-    broadcast_url: str = "",
-) -> discord.Embed:
-    """Build embed for round start announcement."""
-    embed = discord.Embed(
-        title=f"🏁 {round_name} — STARTED!",
-        description=commentary,
-        color=0x5865F2,
-        timestamp=datetime.now(timezone.utc),
-    )
-
-    pairings_text = ""
-    for i, p in enumerate(pairings):
-        board = p.get("board", i + 1)
-        pairings_text += f"**Board {board}**: {p['white']} vs {p['black']}\n"
-
-    embed.add_field(
-        name=f"📋 Pairings ({len(pairings)} games)",
-        value=pairings_text or "Loading pairings...",
-        inline=False
-    )
-
-    if broadcast_url:
-        embed.add_field(name="📺 Watch live", value=f"[Broadcast]({broadcast_url})", inline=False)
-
-    embed.set_footer(text="Maggie Man • Broadcast tracker")
+    embed.set_footer(text="Maggie Man")
     return embed
 
 
@@ -138,52 +72,34 @@ def build_reminder_embed(
     minutes: int,
     commentary: str,
     broadcast_url: str = "",
+    *,
+    tournament_name: str = "",
+    round_url: str = "",
+    pairings_text: str = "",
 ) -> discord.Embed:
-    """Build embed for pre-round reminder."""
+    tname = tournament_name.strip() or "Followed broadcast"
+    desc = f"**{round_name}** starts in ~**{minutes}** min.\n\n{commentary}"
+    if len(desc) > 4096:
+        desc = desc[:4093] + "…"
     embed = discord.Embed(
-        title=f"⏰ {round_name} starts in {minutes} minutes!",
-        description=commentary,
+        title=f"⏰ Followed: {tname}",
+        description=desc,
         color=0xFF8C00,
         timestamp=datetime.now(timezone.utc),
     )
+    links: list[str] = []
     if broadcast_url:
+        links.append(f"[Tournament]({broadcast_url})")
+    if round_url:
+        links.append(f"[This round]({round_url})")
+    if links:
+        embed.add_field(name="Links", value=" · ".join(links), inline=False)
+    if pairings_text.strip():
+        pt = pairings_text.strip()
         embed.add_field(
-            name="📺 Broadcast",
-            value=f"[Watch on Lichess]({broadcast_url})",
+            name="Pairings",
+            value=pt[:1020] + ("…" if len(pt) > 1020 else ""),
             inline=False,
         )
-    embed.set_footer(text="Maggie Man • Don't miss it")
-    return embed
-
-
-def build_game_over_embed(
-    white: str,
-    black: str,
-    result: str,
-    round_name: str,
-    board_number: int | None,
-    total_moves: int,
-) -> discord.Embed:
-    """Build embed for a game ending."""
-    if result == "1-0":
-        winner = white
-        emoji = "⬜"
-    elif result == "0-1":
-        winner = black
-        emoji = "⬛"
-    else:
-        winner = "Draw"
-        emoji = "🤝"
-
-    board_str = f"Board {board_number}: " if board_number else ""
-    embed = discord.Embed(
-        title=f"{emoji} Game Over — {board_str}{white} vs {black}",
-        description=f"**Result:** `{result}` | **Moves:** {total_moves}",
-        color=0x808080,
-        timestamp=datetime.now(timezone.utc),
-    )
-    if result != "1/2-1/2":
-        embed.add_field(name="🏆 Winner", value=winner, inline=True)
-    embed.add_field(name="🎯 Round", value=round_name, inline=True)
-    embed.set_footer(text="Maggie Man")
+    embed.set_footer(text="Maggie Man · followed tournament reminder")
     return embed

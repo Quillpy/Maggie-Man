@@ -1,10 +1,10 @@
-"""Format Lichess broadcast API data for Discord embeds."""
-
 from __future__ import annotations
 
 from datetime import datetime, timezone
 
 import discord
+
+from pairings import sort_broadcast_rounds
 
 
 def _ms_to_dt(ms: int | float | None) -> datetime | None:
@@ -30,10 +30,10 @@ def _truncate(s: str, max_len: int = 1020) -> str:
     return s[: max_len - 1] + "…"
 
 
-def tour_info_lines(tour: dict) -> str:
+def tour_info_lines(tour: dict, *, include_name: bool = True) -> str:
     info = tour.get("info") or {}
     lines: list[str] = []
-    if tour.get("name"):
+    if include_name and tour.get("name"):
         lines.append(f"**{tour['name']}**")
     if info.get("format"):
         lines.append(f"Format: {info['format']}")
@@ -45,18 +45,102 @@ def tour_info_lines(tour: dict) -> str:
         lines.append(f"Location: {info['location']}")
     if info.get("timeZone"):
         lines.append(f"Time zone: {info['timeZone']}")
+    if info.get("players"):
+        lines.append(f"Players: {_truncate(info['players'], 400)}")
+    if info.get("website"):
+        lines.append(f"Website: {info['website']}")
+    if info.get("standings"):
+        lines.append(f"Standings: {info['standings']}")
     dates = tour.get("dates") or []
     if len(dates) >= 1:
         lines.append(f"Starts: {format_lichess_time(dates[0])}")
     if len(dates) >= 2:
         lines.append(f"Ends: {format_lichess_time(dates[1])}")
+    if tour.get("tier") is not None:
+        lines.append(f"Tier: {tour['tier']}")
     if tour.get("url"):
         lines.append(f"[Broadcast]({tour['url']})")
     return _truncate("\n".join(lines))
 
 
+def _round_line(r: dict, idx: int) -> str:
+    name = r.get("name") or f"Round {idx}"
+    start = format_lichess_time(r.get("startsAt"))
+    bits = [f"**{idx}.** {name}", f"starts {start}"]
+    if r.get("finished"):
+        bits.append("(finished)")
+    elif r.get("ongoing") or r.get("started"):
+        bits.append("(live)")
+    url = r.get("url")
+    if url:
+        bits.append(f"[link]({url})")
+    return " · ".join(bits)
+
+
+def embed_from_full_tournament(api: dict, index: int) -> discord.Embed:
+    """Rich embed from GET /api/broadcast/{{id}} JSON."""
+    tour = api.get("tour") or {}
+    title = tour.get("name") or "Broadcast"
+    desc_parts: list[str] = []
+
+    if tour.get("description"):
+        desc_parts.append(_truncate(tour["description"], 1800))
+
+    desc_parts.append(tour_info_lines(tour, include_name=False))
+    description = _truncate("\n\n".join(p for p in desc_parts if p), 4000)
+
+    emb = discord.Embed(
+        title=f"{index}. {title}",
+        description=description,
+        color=0x5865F2,
+        url=tour.get("url"),
+    )
+
+    rounds = sort_broadcast_rounds(api.get("rounds") or [])
+    if rounds:
+        chunks: list[str] = []
+        current = ""
+        for i, r in enumerate(rounds, start=1):
+            line = _round_line(r, i)
+            if len(current) + len(line) + 1 > 950:
+                chunks.append(current)
+                current = line
+            else:
+                current = f"{current}\n{line}" if current else line
+        if current:
+            chunks.append(current)
+        for ci, chunk in enumerate(chunks[:4]):
+            emb.add_field(
+                name="Rounds" if ci == 0 else f"Rounds (cont. {ci + 1})",
+                value=_truncate(chunk, 1020),
+                inline=False,
+            )
+        if len(chunks) > 4:
+            emb.add_field(
+                name="Note",
+                value=f"+ {len(chunks) - 4} more round block(s) — open the broadcast on Lichess.",
+                inline=False,
+            )
+
+    dr = api.get("defaultRoundId")
+    if dr:
+        emb.add_field(name="Default round id", value=f"`{dr}`", inline=True)
+
+    grp = api.get("group")
+    if isinstance(grp, dict) and grp.get("name"):
+        emb.add_field(name="Group", value=_truncate(str(grp.get("name")), 200), inline=True)
+
+    tid = tour.get("id")
+    if tid:
+        emb.set_footer(text=f"Tournament id: {tid} — use with /pair")
+
+    if tour.get("image"):
+        emb.set_thumbnail(url=tour["image"])
+
+    return emb
+
+
 def embed_from_search_hit(hit: dict, index: int) -> discord.Embed:
-    """One search / top result: { tour, round } shape."""
     tour = hit.get("tour") or {}
     rnd = hit.get("round") or {}
     title = tour.get("name") or "Broadcast"
@@ -68,7 +152,7 @@ def embed_from_search_hit(hit: dict, index: int) -> discord.Embed:
     )
     if rnd.get("name"):
         emb.add_field(
-            name="Latest / listed round",
+            name="Round (search snapshot)",
             value=_truncate(
                 f"{rnd.get('name', '')}\n"
                 f"Starts: {format_lichess_time(rnd.get('startsAt'))}\n"
@@ -76,121 +160,7 @@ def embed_from_search_hit(hit: dict, index: int) -> discord.Embed:
             ),
             inline=False,
         )
-    if tour.get("id"):
-        emb.set_footer(text=f"Tournament ID: {tour['id']}")
-    return emb
-
-
-def embed_broadcast_tournament(data: dict) -> discord.Embed:
-    """Full GET /api/broadcast/{{id}} response."""
-    tour = data.get("tour") or {}
-    title = tour.get("name") or "Broadcast tournament"
-    emb = discord.Embed(
-        title=title,
-        description=tour_info_lines(tour),
-        color=0xFFD700,
-        url=tour.get("url"),
-    )
-    rounds = data.get("rounds") or []
-    lines: list[str] = []
-    for r in rounds[:20]:
-        st = "🔴 live" if r.get("ongoing") else ("✓ done" if r.get("finished") else "⏳")
-        lines.append(
-            f"{st} **{r.get('name', '?')}** — {format_lichess_time(r.get('startsAt'))} "
-            f"`{r.get('id', '')}`"
-        )
-    if len(rounds) > 20:
-        lines.append(f"… and {len(rounds) - 20} more rounds")
-    emb.add_field(
-        name=f"Rounds ({len(rounds)})",
-        value=_truncate("\n".join(lines) if lines else "No rounds listed."),
-        inline=False,
-    )
-    if tour.get("id"):
-        emb.set_footer(text=f"Tournament ID: {tour['id']}")
-    return emb
-
-
-def embed_broadcast_round(data: dict) -> discord.Embed:
-    rnd = data.get("round") or data
-    name = rnd.get("name") or data.get("name") or "Round"
-    url = rnd.get("url") or data.get("url")
-    emb = discord.Embed(title=name, color=0x5865F2, url=url)
-    emb.add_field(
-        name="Starts",
-        value=format_lichess_time(rnd.get("startsAt")),
-        inline=True,
-    )
-    emb.add_field(
-        name="Ongoing",
-        value=str(rnd.get("ongoing", False)),
-        inline=True,
-    )
-    emb.add_field(
-        name="Finished",
-        value=str(rnd.get("finished", False)),
-        inline=True,
-    )
-    games = data.get("games") or []
-    if games:
-        glines = []
-        for g in games[:12]:
-            pl = g.get("players") or []
-            if len(pl) >= 2:
-                w = pl[0].get("name", "?")
-                b = pl[1].get("name", "?")
-                glines.append(f"{w} vs {b}")
-            elif g.get("name"):
-                glines.append(g["name"])
-            else:
-                glines.append(str(g.get("id", "?")))
-        if len(games) > 12:
-            glines.append(f"… +{len(games) - 12} games")
-        emb.add_field(name="Games", value=_truncate("\n".join(glines)), inline=False)
-    rid = rnd.get("id") or data.get("id")
-    if rid:
-        emb.set_footer(text=f"Round ID: {rid}")
-    return emb
-
-
-def embed_players_list(players: list) -> discord.Embed:
-    emb = discord.Embed(title="Broadcast players", color=0x5865F2)
-    lines = []
-    for p in players[:25]:
-        if isinstance(p, dict):
-            name = p.get("name") or p.get("id") or str(p)
-            lines.append(name)
-        else:
-            lines.append(str(p))
-    if len(players) > 25:
-        lines.append(f"… +{len(players) - 25} more")
-    emb.description = _truncate("\n".join(lines) if lines else "No players.")
-    emb.set_footer(text=f"{len(players)} players")
-    return emb
-
-
-def embed_player_detail(data: dict) -> discord.Embed:
-    name = data.get("name") or data.get("id") or "Player"
-    emb = discord.Embed(title=name, color=0x5865F2)
-    for key in ("fideId", "fed", "rating", "title"):
-        if data.get(key) is not None:
-            emb.add_field(name=key, value=str(data[key]), inline=True)
-    games = data.get("games") or []
-    if games:
-        emb.add_field(name="Games", value=str(len(games)), inline=True)
-    emb.description = _truncate(str(data.get("bio") or data.get("description") or ""))
-    return emb
-
-
-def embed_team_standings(rows: list) -> discord.Embed:
-    emb = discord.Embed(title="Team standings", color=0x5865F2)
-    lines = []
-    for i, row in enumerate(rows[:20], 1):
-        if isinstance(row, dict):
-            team = row.get("team") or row.get("name") or str(row)
-            score = row.get("score", row.get("points", ""))
-            lines.append(f"{i}. {team} — {score}")
-        else:
-            lines.append(str(row))
-    emb.description = _truncate("\n".join(lines) if lines else "No standings.")
+    tid = tour.get("id")
+    if tid:
+        emb.set_footer(text=f"Tournament id: {tid}")
     return emb

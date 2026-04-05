@@ -12,3 +12,7 @@ venv/
 
 # Secrets
 .env
+
+# Runtime data
+data/followed_broadcast.json
+data/followed_board.json

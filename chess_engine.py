@@ -1,57 +1,54 @@
-import aiohttp
 import asyncio
 import logging
+
+import aiohttp
 
 logger = logging.getLogger("maggie-man.engine")
 
 CHESS_API_URL = "https://chess-api.com/v1"
 
-# Move classification thresholds (centipawns = cp / 100 = pawns)
-# delta = how much the moving side LOST in eval
-BLUNDER_THRESHOLD  = 200   # cp drop >= 200 = blunder
-MISTAKE_THRESHOLD  = 100   # cp drop >= 100 = mistake
-INACCURACY_THRESHOLD = 50  # cp drop >= 50  = inaccuracy
-BRILLIANCY_GAIN    = 150   # cp GAIN >= 150 for moving side = brilliancy
+BLUNDER_CP = 300
+MISTAKE_CP = 100
+INACCURACY_CP = 50
+BRILLIANT_GAIN_CP = 200
+GREAT_MOVE_GAIN_CP = 100
 
-ALERT_CLASSIFICATIONS = {"blunder", "mistake", "brilliancy"}
+ALERT_CLASSIFICATIONS = frozenset(
+    {"blunder", "mistake", "inaccuracy", "brilliancy", "great_move"}
+)
 
 
 def _cp_to_pawns(cp: int | float) -> float:
     return cp / 100.0
 
 
-def classify_move(cp_before: float | None, cp_after: float | None,
-                  turn_before: str) -> str:
-    
-    # Classify a move based on centipawn change.
-
-    #cp_before / cp_after: eval in PAWNS from white's POV.
-    #turn_before: 'w' (white just moved) or 'b' (black just moved).
-
-    # A white move is good if cp goes UP (white gains advantage).
-    #A black move is good if cp goes DOWN (black gains advantage).
-    
-    # if cp_before is None or cp_after is None:
-        #return "unknown"
-
-    # Convert to moving-side delta: positive = moving side gained
-    if turn_before == "w":
-        delta = cp_after - cp_before        # positive = white gained (good)
-    else:
-        delta = cp_before - cp_after        # positive = black gained (good)
-
-    delta_cp = delta * 100  # back to centipawns for threshold comparison
-
-    if delta_cp <= -BLUNDER_THRESHOLD:
-        return "blunder"
-    elif delta_cp <= -MISTAKE_THRESHOLD:
-        return "mistake"
-    elif delta_cp <= -INACCURACY_THRESHOLD:
-        return "inaccuracy"
-    elif delta_cp >= BRILLIANCY_GAIN:
-        return "brilliancy"
-    else:
+def classify_move(
+    cp_before: float | None,
+    cp_after: float | None,
+    turn_before: str,
+) -> str:
+    if cp_after is None:
         return "good"
+    before = 0.0 if cp_before is None else cp_before
+
+    if turn_before == "w":
+        delta = cp_after - before
+    else:
+        delta = before - cp_after
+
+    delta_cp = delta * 100
+
+    if delta_cp <= -BLUNDER_CP:
+        return "blunder"
+    if delta_cp <= -MISTAKE_CP:
+        return "mistake"
+    if delta_cp <= -INACCURACY_CP:
+        return "inaccuracy"
+    if delta_cp >= BRILLIANT_GAIN_CP:
+        return "brilliancy"
+    if delta_cp >= GREAT_MOVE_GAIN_CP:
+        return "great_move"
+    return "good"
 
 
 def is_alert_worthy(classification: str) -> bool:
@@ -75,21 +72,35 @@ def get_winning_side(pawns: float | None, mate: int | None) -> str:
         return "equal"
     if pawns > 0.3:
         return "white"
-    elif pawns < -0.3:
+    if pawns < -0.3:
         return "black"
     return "equal"
 
 
-def parse_cloud_eval(data: dict) -> tuple[float | None, int | None, str, list[str]]:
-    """
-    Parse a Lichess cloud-eval response into usable values.
+def summarize_cloud_eval_for_prompt(data: dict | None) -> str:
+    """Compact text of Lichess cloud-eval JSON for LLM context."""
+    if not data:
+        return "No Lichess cloud-eval (used fallback engine if any)."
+    pvs = data.get("pvs") or []
+    if not pvs:
+        return "Cloud-eval returned no principal variations."
+    lines: list[str] = []
+    for i, pv in enumerate(pvs[:3], start=1):
+        cp = pv.get("cp")
+        mate = pv.get("mate")
+        moves = (pv.get("moves") or "").split()
+        head = " ".join(moves[:12]) if moves else "(no moves)"
+        if mate is not None:
+            ev = f"mate in {mate}"
+        elif cp is not None:
+            ev = f"{cp / 100.0:+.2f} pawns"
+        else:
+            ev = "?"
+        lines.append(f"Line {i} ({ev}): {head}")
+    return "\n".join(lines)
 
-    Returns: (eval_pawns, mate, best_move_uci, continuation_uci_list)
-    eval_pawns: white-POV pawn value (None if mate)
-    mate: forced mate in N (None if not forced)
-    best_move_uci: e.g. "e2e4"
-    continuation: list of UCI moves for best line
-    """
+
+def parse_cloud_eval(data: dict) -> tuple[float | None, int | None, str, list[str]]:
     pvs = data.get("pvs", [])
     if not pvs:
         return None, None, "?", []
@@ -108,12 +119,6 @@ def parse_cloud_eval(data: dict) -> tuple[float | None, int | None, str, list[st
 
 
 async def evaluate_with_chess_api(fen: str) -> tuple[float | None, int | None, str, list[str]]:
-    """
-    Fallback: evaluate via chess-api.com (free Stockfish REST API).
-    Used when Lichess cloud eval has no cached data for the position.
-
-    Returns: (eval_pawns, mate, best_move_san, continuation)
-    """
     payload = {
         "fen": fen,
         "depth": 15,
@@ -129,7 +134,6 @@ async def evaluate_with_chess_api(fen: str) -> tuple[float | None, int | None, s
             ) as resp:
                 if resp.status == 200:
                     d = await resp.json()
-                    # chess-api returns type: "bestmove" | "move" | "info"
                     ev = d.get("eval")
                     mate = d.get("mate")
                     san = d.get("san") or d.get("move", "?")
@@ -141,5 +145,5 @@ async def evaluate_with_chess_api(fen: str) -> tuple[float | None, int | None, s
         logger.warning("chess-api.com: timed out")
         return None, None, "?", []
     except Exception as e:
-        logger.error(f"chess-api.com error: {e}")
+        logger.error("chess-api.com error: %s", e)
         return None, None, "?", []
