@@ -47,7 +47,7 @@ Enable the **Message Content Intent** for the bot if you rely on message content
 | `GROQ_API_KEY` | yes | |
 | `GROQ_MODEL` | no | Default `openai/gpt-oss-120b` |
 | `LICHESS_API_BASE` / `LICHESS_SITE_BASE` | no | Defaults `https://lichess.org/api` and `https://lichess.org` |
-| `LICHESS_API_TOKEN` | no | Optional OAuth bearer |
+| `LICHESS_API_TOKEN` | no | OAuth bearer | Optional 
 | `POLL_INTERVAL_SECONDS` | no | Default `10` |
 | `REMINDER_MINUTES_BEFORE` | no | Default `60` |
 | `ROUND_CHECK_INTERVAL_SECONDS` | no | Default `120` |
