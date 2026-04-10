@@ -67,6 +67,7 @@ Sync cmds: `/sync` if GUILD_ID set (dev).
 5. Logs in Railway dashboard.
 
 **Railway tips**:
+- Add **Procfile**: `worker
 - Procfile not needed (detects).
 - data/ dir ephemeral; follows JSON lost on restart (add Railway volume or Redis later).
 - Free tier OK for low traffic.
