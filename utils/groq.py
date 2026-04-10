@@ -52,8 +52,8 @@ async def generate_move_commentary(
 {board_str}
 {white} vs {black}
 Move: {move_san} — {classification.upper()}
-Eval: {format_eval(eval_before, None)} → {format_eval(eval_after, None)} ({winning_side} ahead)
-Engine top: {top_move}  Line: {cont_str}
+Eval: {eval_before:+.1f} → {eval_after:+.1f} ({winning_side} ahead)
+Engine top: {top_move} Line: {cont_str}
 Give a quick sarcastic or playful line in plain language. Mention the move and what the engine wanted."""
 
     messages = [
@@ -100,3 +100,32 @@ async def generate_reminder_message(
         )
     except Exception:
         return f"{round_name} in ~{minutes_before} min. Don't be late."
+
+async def generate_game_summary(
+    white: str,
+    black: str,
+    result: str,
+    pgn_text: str,
+    groq_api_key: str,
+    model: str,
+) -> str:
+    prompt = f"""Game PGN: {pgn_text[:2000]}...
+{white} vs {black}, final result: {result}
+Give a short Maggie-style recap: key moments, funny take, winner praise. Keep it light, 2-4 sentences."""
+
+    messages = [
+        {"role": "system", "content": MAGGIE_MAN_SYSTEM},
+        {"role": "user", "content": prompt},
+    ]
+    try:
+        return await asyncio.to_thread(
+            _run_groq_chat,
+            groq_api_key,
+            model,
+            messages,
+            0.8,
+            300,
+        )
+    except Exception:
+        return f"Solid game {white}-{black} {result}. GG!"
+

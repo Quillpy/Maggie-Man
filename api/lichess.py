@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import aiohttp
 from typing import Any
+from utils.pgn import parse_pgn_games
 
 class LichessClient:
     def __init__(
@@ -89,6 +90,16 @@ class LichessClient:
             headers={"Accept": "application/x-chess-pgn"},
         )
 
+    async def get_round_pairings(self, round_id: str) -> list[dict]:
+        pgn = await self.get_round_pgn(round_id)
+        if not pgn:
+            return []
+        games = parse_pgn_games(pgn)
+        return [{"board": i+1, "white": g["white"], "black": g["black"]} for i, g in enumerate(games)]
+
+    async def get_game_url(self, tournament_id: str, round_id: str, board_num: int) -> str:
+        return f"{self.site_base}/broadcast/{tournament_id}/{round_id}/{board_num}"
+
     async def cloud_eval(self, fen: str, multi_pv: int = 3) -> dict | None:
         params = {"fen": fen, "multiPv": str(multi_pv)}
         try:
@@ -103,3 +114,4 @@ class LichessClient:
                 return None
         except Exception:
             return None
+

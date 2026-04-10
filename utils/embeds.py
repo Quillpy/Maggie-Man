@@ -1,5 +1,3 @@
-
-
 from datetime import datetime, timezone
 
 import discord
@@ -102,3 +100,33 @@ def build_reminder_embed(
         )
     embed.set_footer(text="Maggie Man · followed tournament reminder")
     return embed
+
+def build_pairings_embed(round_name: str, pairings: list[dict], tid: str = "") -> discord.Embed:
+    embed = discord.Embed(title=f"{round_name} - Pairings", color=0x5865F2)
+    for p in pairings:
+        name = f"Board {p['board']}"
+        value = f"{p['white']} vs {p['black']}"
+        embed.add_field(name=name, value=value, inline=True)
+    if tid:
+        embed.set_footer(text=f"Tournament: {tid}")
+    return embed
+
+def build_game_end_embed(
+    white: str,
+    black: str,
+    result: str,
+    summary: str,
+    board_number: int | None,
+    round_name: str,
+    game_url: str,
+) -> discord.Embed:
+    title = f"🏁 Game End"
+    if board_number:
+        title += f" - Board {board_number}"
+    embed = discord.Embed(title=title, description=summary, color=0x00AA00, url=game_url)
+    embed.add_field(name=f"Result", value=result, inline=True)
+    embed.add_field(name="Players", value=f"{white} vs {black}", inline=True)
+    embed.add_field(name="Round", value=round_name, inline=True)
+    embed.set_footer(text="Maggie Man")
+    return embed
+

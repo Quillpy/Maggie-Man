@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
-import re
 
 import discord
 from discord import app_commands
@@ -12,9 +10,13 @@ from discord.ext import commands
 import settings
 from api.lichess import LichessClient
 from core.monitor import TournamentMonitor
-from storage.follow import load_followed, save_followed
-from utils.engine import is_valid_broadcast_tournament_id
+from storage.follow import (
+    load_followed_tournament,
+    save_followed_tournament,
+    load_followed_boards,
+)
 from utils.ui import embed_from_full_tournament, embed_from_search_hit
+from utils.engine import is_valid_broadcast_tournament_id
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,7 +28,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 
 FOLLOW_PREFIX = "fm:follow:"
-
+BOARD_FOLLOW_PREFIX = "bf:follow:"
 
 class MaggieBot(commands.Bot):
     def __init__(self) -> None:
@@ -44,9 +46,7 @@ class MaggieBot(commands.Bot):
             self.lichess = None
         await super().close()
 
-
 bot = MaggieBot()
-
 
 def _button_label(name: str) -> str:
     base = f"Follow · {name}".strip()
@@ -81,6 +81,7 @@ async def _process_follow(interaction: discord.Interaction, tournament_id: str) 
         await interaction.response.send_message("Lichess client not ready.", ephemeral=True)
         return
 
+    guild_id = interaction.guild.id
     await interaction.response.defer(ephemeral=True)
 
     data_json = await bot.lichess.get_broadcast_tournament(tid)
@@ -91,7 +92,7 @@ async def _process_follow(interaction: discord.Interaction, tournament_id: str) 
     tour = data_json.get("tour") or {}
     tour_url = (tour.get("url") or "").strip() or f"{settings.LICHESS_SITE_BASE}/broadcast/-/-/{tid}"
 
-    save_followed(tid, tour_url)
+    save_followed_tournament(guild_id, tid, tour_url)
     if bot.monitor:
         bot.monitor.set_follow(tid, tour_url)
 
@@ -101,8 +102,52 @@ async def _process_follow(interaction: discord.Interaction, tournament_id: str) 
         f"Updates go to <#{settings.DISCORD_CHESS_CHANNEL_ID}>.",
         ephemeral=True,
     )
-    logger.info("Followed broadcast %s", tid)
+    logger.info("Followed broadcast %s for guild %s", tid, guild_id)
 
+async def _process_board_follow(interaction: discord.Interaction, tid: str, rnd: str, bd: int) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message("Use in server.", ephemeral=True)
+        return
+
+    member = interaction.user
+    if not isinstance(member, discord.Member):
+        await interaction.response.send_message("Permissions error.", ephemeral=True)
+        return
+
+    if not member.guild_permissions.manage_guild:
+        await interaction.response.send_message("Manage Server required.", ephemeral=True)
+        return
+
+    if bot.lichess is None:
+        await interaction.response.send_message("Not ready.", ephemeral=True)
+        return
+
+    guild_id = interaction.guild.id
+    await interaction.response.defer(ephemeral=True)
+
+    boards = load_followed_boards(guild_id)
+    tid = tid.strip()
+    rnd = rnd.strip()
+    boards.setdefault(tid, {})
+    rnd_set = boards[tid].setdefault(rnd, set())
+
+    if bd in rnd_set:
+        rnd_set.remove(bd)
+        action = "Unfollowed"
+        if not rnd_set:
+            del boards[tid][rnd]
+        if not boards[tid]:
+            del boards[tid]
+    else:
+        rnd_set.add(bd)
+        action = "Followed"
+
+    save_followed_boards(guild_id, boards)
+    if bot.monitor:
+        bot.monitor.set_boards(guild_id, boards)
+
+    await interaction.followup.send(f"{action} **board {bd}** ({tid}/{rnd}).", ephemeral=True)
+    logger.info("%s board %s %s/%s for guild %s", action, bd, tid, rnd, guild_id)
 
 class FollowTournamentButton(discord.ui.Button):
     def __init__(self, tournament_id: str, display_name: str, row: int) -> None:
@@ -117,6 +162,20 @@ class FollowTournamentButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction) -> None:
         await _process_follow(interaction, self.tournament_id)
 
+class BoardFollowButton(discord.ui.Button):
+    def __init__(self, tid: str, rnd: str, bd: int) -> None:
+        label = "Unfollow board" if True else "Follow board"  # todo check status
+        super().__init__(
+            label=f"Toggle board {bd}",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"{BOARD_FOLLOW_PREFIX}{tid}:{rnd}:{bd}",
+        )
+        self.tid = tid
+        self.rnd = rnd
+        self.bd = bd
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await _process_board_follow(interaction, self.tid, self.rnd, self.bd)
 
 def _search_view(hits: list[dict]) -> discord.ui.View | None:
     view = discord.ui.View(timeout=3600)
@@ -128,12 +187,11 @@ def _search_view(hits: list[dict]) -> discord.ui.View | None:
             continue
         tid = str(tid).strip()
         name = tour.get("name") or tid
-        view.add_item(FollowTournamentButton(tid, name, row=added))
+        view.add_item(FollowTournamentButton(tid, name, added))
         added += 1
     if added == 0:
         return None
     return view
-
 
 @bot.event
 async def on_ready() -> None:
@@ -156,7 +214,8 @@ async def on_ready() -> None:
             oauth_token=settings.LICHESS_API_TOKEN,
         )
 
-    bid, url = load_followed()
+    guild_id = 0
+    bid, url = load_followed_tournament(guild_id)
     bot.monitor = TournamentMonitor(
         bot,
         settings.DISCORD_CHESS_CHANNEL_ID,
@@ -167,7 +226,6 @@ async def on_ready() -> None:
     )
     bot.monitor.start()
     logger.info("Monitor started (following: %s)", bid or "none")
-
 
 @bot.tree.command(
     name="search",
@@ -219,7 +277,6 @@ async def cmd_search(interaction: discord.Interaction, query: str, page: int = 1
         kwargs["view"] = view
     await interaction.followup.send(**kwargs)
 
-
 @bot.tree.command(name="status", description="Bot status (ephemeral)")
 async def cmd_status(interaction: discord.Interaction) -> None:
     m = bot.monitor
@@ -227,10 +284,21 @@ async def cmd_status(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("Monitor not ready.", ephemeral=True)
         return
 
+    guild_id = 0
+    boards = load_followed_boards(guild_id)
+    board_list = []
+    for tid, rnds in boards.items():
+        for rnd, bs in rnds.items():
+            for b in sorted(bs):
+                board_list.append(f"{tid}/{rnd}/{b}")
+    boards_str = "\n".join(board_list[:20]) or "None"
+    if len(board_list) > 20:
+        boards_str += f"\n... +{len(board_list)-20}"
+
     info = m.get_status()
     embed = discord.Embed(title="Maggie Man status", color=0x5865F2)
     embed.add_field(name="Monitor", value="On" if info["running"] else "Off", inline=True)
-    embed.add_field(name="Following", value="Yes" if info["following"] else "No", inline=True)
+    embed.add_field(name="Following tournament", value="Yes" if info["following"] else "No", inline=True)
     embed.add_field(name="Broadcast ID", value=str(info["broadcast_id"]), inline=True)
     embed.add_field(name="Active games", value=str(info["active_games"]), inline=True)
     embed.add_field(name="Rounds tracked", value=str(info["rounds_tracked"]), inline=True)
@@ -239,12 +307,59 @@ async def cmd_status(interaction: discord.Interaction) -> None:
     url = info["broadcast_url"]
     if url and url != "—":
         embed.add_field(name="URL", value=url, inline=False)
+    embed.add_field(name="Followed boards", value=boards_str, inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
+@bot.tree.command(name="pair", description="Round pairings for tournament")
+@app_commands.describe(tid="Tournament ID (8 chars)", rnd="Round ID or name")
+async def cmd_pair(interaction: discord.Interaction, tid: str, rnd: str) -> None:
+    await interaction.response.defer()
+    if bot.lichess is None:
+        await interaction.followup.send("Lichess not ready.", ephemeral=True)
+        return
+    pairings = await bot.lichess.get_round_pairings(rnd)
+    if not pairings:
+        await interaction.followup.send("No pairings found.")
+        return
+    embed = discord.Embed(title=f"Tournament {tid} - Round {rnd} pairings", color=0x5865F2)
+    for p in pairings[:25]:
+        name = f"Board {p['board']}"
+        value = f"{p['white']} vs {p['black']}"
+        embed.add_field(name=name, value=value, inline=True)
+    if len(pairings) > 25:
+        embed.set_footer(text=f"... and {len(pairings)-25} more")
+    await interaction.followup.send(embed=embed)
+
+@bot.tree.command(name="board", description="Follow specific board (Manage Server)")
+@app_commands.describe(tid="Tournament ID", rnd="Round ID/num", board="Board number")
+async def cmd_board(interaction: discord.Interaction, tid: str, rnd: str, board: str) -> None:
+    await interaction.response.defer()
+    if bot.lichess is None:
+        await interaction.followup.send("Not ready.", ephemeral=True)
+        return
+    try:
+        bd = int(board)
+    except ValueError:
+        await interaction.followup.send("Board must be number.", ephemeral=True)
+        return
+    pairings = await bot.lichess.get_round_pairings(rnd)
+    board_p = next((p for p in pairings if p["board"] == bd), None)
+    if not board_p:
+        await interaction.followup.send(f"No board {bd} in round {rnd}.", ephemeral=True)
+        return
+    game_url = bot.lichess.get_game_url(tid, rnd, bd)
+    embed = discord.Embed(
+        title=f"Board {bd}: {board_p['white']} vs {board_p['black']}",
+        url=game_url,
+        color=0x5865F2,
+    )
+    embed.add_field(name="Stream", value=game_url, inline=False)
+    view = discord.ui.View(timeout=300)
+    view.add_item(BoardFollowButton(tid, rnd, bd))
+    await interaction.followup.send(embed=embed, view=view)
 
 def main() -> None:
     bot.run(settings.DISCORD_BOT_TOKEN)
-
 
 if __name__ == "__main__":
     main()

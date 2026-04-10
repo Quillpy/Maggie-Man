@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Dict, Set
 
 import discord
 
@@ -49,24 +49,32 @@ class TournamentMonitor:
         lichess_client: LichessClient | None = None,
         initial_broadcast_id: str | None = None,
         initial_broadcast_url: str | None = None,
+        guild_id: int = 0,
     ):
         self.bot = bot
         self.channel_id = channel_id
         self.groq_api_key = groq_api_key
-        self.broadcast_id = initial_broadcast_id or None
-        self.broadcast_url = initial_broadcast_url or ""
         self.lichess = lichess_client or LichessClient(
             api_base=settings.LICHESS_API_BASE,
             cloud_eval_url=settings.LICHESS_CLOUD_EVAL_URL,
             site_base=settings.LICHESS_SITE_BASE,
             oauth_token=settings.LICHESS_API_TOKEN,
         )
-        self.rounds: dict[str, RoundState] = {}
+        self.broadcast_id = initial_broadcast_id or None
+        self.broadcast_url = initial_broadcast_url or ""
+        self.guild_id = guild_id
+        self.followed_boards: Dict[str, Dict[str, Set[int]]] = {}
+        self._load_boards()
+        self.rounds: Dict[str, RoundState] = {}
         self.active_round_id: str | None = None
         self._running = False
         self._moves_analysed = 0
         self._poll_task: asyncio.Task | None = None
         self._round_check_task: asyncio.Task | None = None
+
+    def _load_boards(self):
+        from storage.follow import load_followed_boards
+        self.followed_boards = load_followed_boards(self.guild_id)
 
     def set_follow(self, broadcast_id: str, broadcast_url: str) -> None:
         self.broadcast_id = broadcast_id.strip()
@@ -74,6 +82,11 @@ class TournamentMonitor:
         self.rounds.clear()
         self.active_round_id = None
         self._moves_analysed = 0
+
+    def set_boards(self, guild_id: int, boards: Dict[str, Dict[str, Set[int]]]) -> None:
+        self.guild_id = guild_id
+        self.followed_boards = boards
+        self._load_boards()
 
     def start(self) -> None:
         self._running = True
@@ -91,11 +104,13 @@ class TournamentMonitor:
         active_games = 0
         if self.active_round_id and self.active_round_id in self.rounds:
             active_games = len(self.rounds[self.active_round_id].games)
+        boards_count = sum(len(bs) for rnds in self.followed_boards.values() for bs in rnds.values())
         return {
             "running": self._running,
             "active_games": active_games,
             "rounds_tracked": len(self.rounds),
             "moves_analysed": self._moves_analysed,
+            "followed_boards": boards_count,
             "active_round": self.active_round_id,
             "broadcast_id": self.broadcast_id or "—",
             "broadcast_url": self.broadcast_url or "—",
@@ -178,7 +193,7 @@ class TournamentMonitor:
                 if self.broadcast_id and self.active_round_id:
                     await self._poll_active_round()
             except Exception:
-                pass
+                logger.exception("Poll error")
             await asyncio.sleep(settings.POLL_INTERVAL_SECONDS)
 
     async def _poll_active_round(self) -> None:
@@ -200,13 +215,19 @@ class TournamentMonitor:
 
         round_name = round_state.round_name
 
+        rnd_boards = self.followed_boards.get(self.broadcast_id or "", {}).get(round_id, set())
+        is_full_round = bool(self.broadcast_id)
+        process_board = lambda b: is_full_round or b in rnd_boards
+
         for i, game in enumerate(games):
             game_id = get_game_id(game)
-
             try:
                 board_num = int(game["headers"].get("Board", i + 1))
             except:
                 board_num = i + 1
+
+            if not process_board(board_num):
+                continue
 
             if game_id not in round_state.games:
                 round_state.games[game_id] = GameState(
@@ -222,8 +243,9 @@ class TournamentMonitor:
                 continue
 
             if is_game_over(game) and game_id not in round_state.finished_game_ids:
-                gs.is_over = True
                 round_state.finished_game_ids.add(game_id)
+                await self._send_game_end(game, gs, round_name, round_id)
+                gs.is_over = True
                 continue
 
             current_move_count = get_move_count(game)
@@ -266,6 +288,22 @@ class TournamentMonitor:
             gs.last_fen = latest_fen
             gs.last_eval = eval_after
             gs.last_mate = mate_after
+
+    async def _send_game_end(self, game: dict, gs: GameState, round_name: str, round_id: str) -> None:
+        channel = await self._get_channel()
+        if not channel:
+            return
+        game_url = self.lichess.get_game_url(self.broadcast_id or "", round_id, gs.board_number or 1)
+        result = game.get("result", "*")
+        summary = f"**{gs.white}** vs **{gs.black}**: {result} \n\nGame summary (Maggie coming soon!)"
+        embed = discord.Embed(
+            title=f"🏁 Game Over - Board {gs.board_number}",
+            description=summary,
+            color=0x00AA00,
+            url=game_url,
+        )
+        embed.add_field(name="Round", value=round_name, inline=True)
+        await channel.send(embed=embed)
 
     async def _evaluate(
         self, fen: str
@@ -373,3 +411,4 @@ class TournamentMonitor:
         )
 
         await channel.send(embed=embed)
+
