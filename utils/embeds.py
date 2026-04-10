@@ -1,18 +1,19 @@
+
+
 from datetime import datetime, timezone
 
 import discord
 
-from chess_engine import format_eval, get_winning_side
+from utils.engine import format_eval, get_winning_side
 
 CLASSIFICATION_CONFIG = {
     "blunder": {"emoji": "💥", "color": 0xFF0000, "label": "BLUNDER"},
     "mistake": {"emoji": "😬", "color": 0xFF8C00, "label": "MISTAKE"},
     "inaccuracy": {"emoji": "🤔", "color": 0xAAAAAA, "label": "INACCURACY"},
-    "brilliancy": {"emoji": "✨", "color": 0xFFD700, "label": "BRILLIANT"},
     "great_move": {"emoji": "👍", "color": 0x57F287, "label": "GREAT MOVE"},
+    "brilliant": {"emoji": "✨", "color": 0xFFD700, "label": "BRILLIANT"},
     "good": {"emoji": "♟️", "color": 0x5865F2, "label": "MOVE"},
 }
-
 
 def build_move_embed(
     white: str,
@@ -66,13 +67,11 @@ def build_move_embed(
     embed.set_footer(text="Maggie Man")
     return embed
 
-
 def build_reminder_embed(
     round_name: str,
     minutes: int,
     commentary: str,
     broadcast_url: str = "",
-    *,
     tournament_name: str = "",
     round_url: str = "",
     pairings_text: str = "",

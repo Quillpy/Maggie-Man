@@ -1,9 +1,8 @@
 import asyncio
+import aiohttp
 import logging
 
-import aiohttp
-
-logger = logging.getLogger("maggie-man.engine")
+logger = logging.getLogger("engine")
 
 CHESS_API_URL = "https://chess-api.com/v1"
 
@@ -14,13 +13,11 @@ BRILLIANT_GAIN_CP = 200
 GREAT_MOVE_GAIN_CP = 100
 
 ALERT_CLASSIFICATIONS = frozenset(
-    {"blunder", "mistake", "inaccuracy", "brilliancy", "great_move"}
+    {"blunder", "mistake", "inaccuracy", "brilliant", "great_move"}
 )
-
 
 def _cp_to_pawns(cp: int | float) -> float:
     return cp / 100.0
-
 
 def classify_move(
     cp_before: float | None,
@@ -45,15 +42,13 @@ def classify_move(
     if delta_cp <= -INACCURACY_CP:
         return "inaccuracy"
     if delta_cp >= BRILLIANT_GAIN_CP:
-        return "brilliancy"
+        return "brilliant"
     if delta_cp >= GREAT_MOVE_GAIN_CP:
         return "great_move"
     return "good"
 
-
 def is_alert_worthy(classification: str) -> bool:
     return classification in ALERT_CLASSIFICATIONS
-
 
 def format_eval(pawns: float | None, mate: int | None) -> str:
     if mate is not None:
@@ -63,7 +58,6 @@ def format_eval(pawns: float | None, mate: int | None) -> str:
         return "?"
     sign = "+" if pawns >= 0 else ""
     return f"{sign}{pawns:.2f}"
-
 
 def get_winning_side(pawns: float | None, mate: int | None) -> str:
     if mate is not None:
@@ -76,14 +70,12 @@ def get_winning_side(pawns: float | None, mate: int | None) -> str:
         return "black"
     return "equal"
 
-
 def summarize_cloud_eval_for_prompt(data: dict | None) -> str:
-    """Compact text of Lichess cloud-eval JSON for LLM context."""
     if not data:
-        return "No Lichess cloud-eval (used fallback engine if any)."
+        return "No Lichess cloud-eval."
     pvs = data.get("pvs") or []
     if not pvs:
-        return "Cloud-eval returned no principal variations."
+        return "Cloud-eval no variations."
     lines: list[str] = []
     for i, pv in enumerate(pvs[:3], start=1):
         cp = pv.get("cp")
@@ -98,7 +90,6 @@ def summarize_cloud_eval_for_prompt(data: dict | None) -> str:
             ev = "?"
         lines.append(f"Line {i} ({ev}): {head}")
     return "\n".join(lines)
-
 
 def parse_cloud_eval(data: dict) -> tuple[float | None, int | None, str, list[str]]:
     pvs = data.get("pvs", [])
@@ -116,7 +107,6 @@ def parse_cloud_eval(data: dict) -> tuple[float | None, int | None, str, list[st
     eval_pawns = _cp_to_pawns(cp) if cp is not None else None
 
     return eval_pawns, mate, best_move, moves_list
-
 
 async def evaluate_with_chess_api(fen: str) -> tuple[float | None, int | None, str, list[str]]:
     payload = {
@@ -141,9 +131,6 @@ async def evaluate_with_chess_api(fen: str) -> tuple[float | None, int | None, s
                     pawns = ev if ev is not None else None
                     return pawns, mate, san, cont
                 return None, None, "?", []
-    except asyncio.TimeoutError:
-        logger.warning("chess-api.com: timed out")
+    except Exception:
         return None, None, "?", []
-    except Exception as e:
-        logger.error("chess-api.com error: %s", e)
-        return None, None, "?", []
+

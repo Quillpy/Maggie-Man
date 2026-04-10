@@ -1,13 +1,7 @@
 from __future__ import annotations
 
-import json
-import logging
-from typing import Any
-
 import aiohttp
-
-logger = logging.getLogger("maggie-man.lichess")
-
+from typing import Any
 
 class LichessClient:
     def __init__(
@@ -33,7 +27,7 @@ class LichessClient:
         if self.session is None or self.session.closed:
             self.session = aiohttp.ClientSession(
                 headers={
-                    "User-Agent": "MaggieManBot/1.0 (Discord Chess Bot)",
+                    "User-Agent": "MaggieManBot/1.0",
                     **self._auth_headers(),
                 },
                 timeout=aiohttp.ClientTimeout(total=30),
@@ -51,11 +45,8 @@ class LichessClient:
             async with session.get(url, **kwargs) as resp:
                 if resp.status == 200:
                     return await resp.json()
-                body = await resp.text()
-                logger.warning("GET %s → HTTP %s: %s", url, resp.status, body[:300])
                 return None
-        except Exception as e:
-            logger.error("GET %s error: %s", url, e, exc_info=True)
+        except Exception:
             return None
 
     async def _get_text(self, url: str, **kwargs: Any) -> str | None:
@@ -64,11 +55,8 @@ class LichessClient:
             async with session.get(url, **kwargs) as resp:
                 if resp.status == 200:
                     return await resp.text()
-                body = await resp.text()
-                logger.warning("GET %s → HTTP %s: %s", url, resp.status, body[:200])
                 return None
-        except Exception as e:
-            logger.error("GET %s error: %s", url, e, exc_info=True)
+        except Exception:
             return None
 
     async def search_broadcasts(self, q: str, page: int = 1) -> dict | None:
@@ -112,14 +100,6 @@ class LichessClient:
             ) as resp:
                 if resp.status == 200:
                     return await resp.json()
-                if resp.status == 404:
-                    logger.debug("cloud_eval: cache miss (404)")
-                    return None
-                logger.warning("cloud_eval: HTTP %s", resp.status)
                 return None
-        except TimeoutError:
-            logger.warning("cloud_eval: timed out")
-            return None
-        except Exception as e:
-            logger.error("cloud_eval error: %s", e)
+        except Exception:
             return None
