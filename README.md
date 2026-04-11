@@ -1,6 +1,7 @@
 # Maggie Man — Lichess Tournament Discord Bot
 
 Advanced Discord bot for following Lichess tournaments and games. Maggie provides move alerts, game summaries, Magnus-style commentary via Groq AI.
+Note: The bot is in alpha version (incomplete)
 
 ## Commands
 
